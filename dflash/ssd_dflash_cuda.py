@@ -440,25 +440,27 @@ def dflash_ssd_generate(
         h_sim = _cosine_sim(H_prev, H_fresh)
 
         # ── Bonus-fan-out cache lookup ────────────────────
-        # The actual bonus token is `output_ids[start]` (just committed above).
-        actual_bonus = int(output_ids[0, start - 1].item())  # new last_tok
+        # After `start += acceptance_length + 1`, output_ids[start] is the bonus
+        # token — the new last_tok that will become position 0 of the NEXT block.
+        # output_ids[start - 1] is the last *accepted draft* token, NOT the bonus.
+        actual_bonus = int(output_ids[0, start].item())   # bonus = new last_tok
         pre_blocks = pre_result["blocks"]  # {bonus_candidate: draft_tokens}
 
         if actual_bonus in pre_blocks:
-            # HIT: a pre-draft with the correct first token is ready.
+            # HIT: pre-draft was generated with correct first token (actual_bonus).
             pre_draft_tokens = pre_blocks[actual_bonus].to(target_device)
             cache_hit = True
         else:
-            # MISS: none of the predicted bonuses matched.
-            # Fall back: run one DFlash pass with stale H + correct first token.
-            # This is sequential (~T_draft overhead) but produces a good draft.
-            miss_tok_d1 = output_ids[:, start - 1: start].to(draft_device)
+            # MISS: run one DFlash pass with stale H + correct first token.
+            # H_prev.shape[1] = acceptance_length + 1, so
+            # ctx_start = start - H_prev.shape[1] = old_start.
+            miss_tok_d1 = output_ids[:, start: start + 1].to(draft_device)
             miss_blk = torch.cat([
                 miss_tok_d1,
                 torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=draft_device),
             ], dim=1)
             _ctx_len_miss = H_prev_d1.shape[1]
-            _ctx_start_miss = (start - 1) - _ctx_len_miss
+            _ctx_start_miss = start - _ctx_len_miss   # = old_start
             miss_pos = position_ids[
                 :, _ctx_start_miss : _ctx_start_miss + _ctx_len_miss + bs
             ].to(draft_device)
@@ -476,14 +478,14 @@ def dflash_ssd_generate(
 
         # ── Optional fast-refine with fresh H ────────────
         if fast_refine:
-            refine_tok_d1 = output_ids[:, start - 1: start].to(draft_device)
+            refine_tok_d1 = output_ids[:, start: start + 1].to(draft_device)
             refine_blk = torch.cat([
                 refine_tok_d1,
                 torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=draft_device),
             ], dim=1)
             H_fresh_d1 = H_fresh.to(draft_device, non_blocking=True)
             _ctx_len_rf = H_fresh_d1.shape[1]
-            _ctx_start_rf = (start - 1) - _ctx_len_rf
+            _ctx_start_rf = start - _ctx_len_rf   # = old_start
             refine_pos = position_ids[
                 :, _ctx_start_rf : _ctx_start_rf + _ctx_len_rf + bs
             ].to(draft_device)
