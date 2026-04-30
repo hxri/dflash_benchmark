@@ -140,9 +140,12 @@ def _print_decode_summary(responses: list[dict], block_size: int | None) -> None
         sd_tpot = np.mean([r["sd"].time_per_output_token for r in responses])
         sd_speedup = baseline_tpot / sd_tpot
         print(f"Spec-SD (SSD baseline):    {1 / sd_tpot:.2f} tok/s  (speedup vs AR: {sd_speedup:.2f}x)")
-        sd_accs = [a for r in responses for a in r["sd"].acceptance_lengths]
-        if sd_accs:
-            print(f"  Avg acceptance length:   {np.mean(sd_accs):.2f}")
+        sd_step_weighted = [a for r in responses for a in r["sd"].acceptance_lengths]
+        sd_per_request = [np.mean(r["sd"].acceptance_lengths) for r in responses if r["sd"].acceptance_lengths]
+        if sd_per_request:
+            print(f"  Avg acceptance length:   {np.mean(sd_per_request):.2f} (dflash-style)")
+        if sd_step_weighted:
+            print(f"  Step-weighted accept:    {np.mean(sd_step_weighted):.2f}")
 
     if block_size is not None:
         dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
@@ -150,9 +153,12 @@ def _print_decode_summary(responses: list[dict], block_size: int | None) -> None
         print(f"DFlash:                    {1 / dflash_tpot:.2f} tok/s  (speedup vs AR: {dflash_speedup_ar:.2f}x)")
         if has_sd:
             print(f"  DFlash vs Spec-SD:       {sd_tpot / dflash_tpot:.2f}x")
-        mean_accept = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
-        print(f"  Avg acceptance length:   {mean_accept:.2f}")
+        dflash_per_request = [np.mean(r[block_size].acceptance_lengths) for r in responses if r[block_size].acceptance_lengths]
+        mean_accept = np.mean(dflash_per_request)
+        print(f"  Avg acceptance length:   {mean_accept:.2f} (dflash-style)")
         acceptance_lengths = list(chain.from_iterable(r[block_size].acceptance_lengths for r in responses))
+        if acceptance_lengths:
+            print(f"  Step-weighted accept:    {np.mean(acceptance_lengths):.2f}")
         histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
         print(f"  Acceptance histogram:    {[f'{x * 100:.1f}%' for x in histogram]}")
 

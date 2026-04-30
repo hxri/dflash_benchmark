@@ -496,6 +496,7 @@ def _aggregate(summaries: list[dict], block_size: int) -> dict:
     mean_acc = [s["mean_acceptance_tokens"] for s in summaries]
     p10_acc = [s["p10_acceptance_tokens"] for s in summaries]
     drift = [s["mean_hidden_drift"] for s in summaries if s["mean_hidden_drift"] is not None]
+    mean_acceptance = float(np.mean(mean_acc)) if mean_acc else 0.0
 
     out = {
         "num_requests": len(summaries),
@@ -504,11 +505,13 @@ def _aggregate(summaries: list[dict], block_size: int) -> dict:
         "mean_time_per_output_token": float(np.mean(tpot)) if tpot else 0.0,
         "mean_decode_tps": float(np.mean(tps)) if tps else 0.0,
         "median_decode_tps": float(np.median(tps)) if tps else 0.0,
-        "mean_acceptance_tokens": float(np.mean(mean_acc)) if mean_acc else 0.0,
+        "mean_acceptance_tokens": mean_acceptance,
+        "avg_acceptance_length": mean_acceptance,
+        "acceptance_definition": "dflash-style mean of per-request mean acceptance",
         "median_acceptance_tokens": float(np.median(mean_acc)) if mean_acc else 0.0,
         "p10_acceptance_tokens": float(np.mean(p10_acc)) if p10_acc else 0.0,
         "block_size": int(block_size),
-        "acceptance_utilization": float(np.mean(mean_acc) / max(block_size, 1)) if mean_acc else 0.0,
+        "acceptance_utilization": float(mean_acceptance / max(block_size, 1)) if mean_acc else 0.0,
         "mean_hidden_drift_cosine": float(np.mean(drift)) if drift else None,
         "stop_reasons": {k: int(v) for k, v in _hist([s["stop_reason"] for s in summaries]).items()},
     }
@@ -530,7 +533,7 @@ def _print_aggregate(agg: dict) -> None:
     table.add_row("Mean decode tok/s", f"{agg['mean_decode_tps']:.2f}")
     table.add_row("Median decode tok/s", f"{agg['median_decode_tps']:.2f}")
     table.add_row("Mean TTFT (s)", f"{agg['mean_ttft']:.4f}")
-    table.add_row("Mean accept tokens", f"{agg['mean_acceptance_tokens']:.2f} / {agg['block_size']}")
+    table.add_row("Avg acceptance length", f"{agg['avg_acceptance_length']:.2f} / {agg['block_size']}")
     table.add_row("Acceptance utilization", f"{agg['acceptance_utilization'] * 100:.1f}%")
     drift = agg.get("mean_hidden_drift_cosine")
     table.add_row("Mean hidden drift cos", "n/a" if drift is None else f"{drift:.4f}")
