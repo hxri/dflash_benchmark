@@ -156,6 +156,7 @@ def _run_one_sample(
                 temperature=args.temperature,
                 fan_out=args.fan_out,
                 acceptance_predictor=predictor,
+                fast_refine=args.fast_refine,
                 return_stats=True,
                 monitor=monitor,
                 log_path=str(log_path),
@@ -330,6 +331,10 @@ def main():
     p.add_argument("--acceptance-strategy", default="running",
                    choices=["running", "top_high"],
                    help="How to predict likely acceptance lengths for fan-out")
+    p.add_argument("--fast-refine", action="store_true",
+                   help="After parallel verify, run one extra DFlash pass with fresh H_t. "
+                        "Fixes acceptance on tasks where H_SIM < 0.85 (e.g. math reasoning). "
+                        "Adds ~T_draft latency but restores standard DFlash acceptance quality.")
     p.add_argument("--target-gpu", type=int, default=0,
                    help="GPU index for target model (default 0)")
     p.add_argument("--draft-gpu",  type=int, default=1,

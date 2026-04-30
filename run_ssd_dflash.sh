@@ -31,6 +31,7 @@ TEMPERATURE="${TEMPERATURE:-0.0}"
 TARGET_GPU="${TARGET_GPU:-0}"
 DRAFT_GPU="${DRAFT_GPU:-1}"
 ACCEPTANCE_STRATEGY="${ACCEPTANCE_STRATEGY:-running}"
+FAST_REFINE="${FAST_REFINE:-0}"   # set to 1 when H_SIM < 0.85 (e.g. math reasoning)
 OUT_DIR="${OUT_DIR:-results/ssd_dflash}"
 ANALYSIS_DIR="${OUT_DIR}/analysis"
 
@@ -143,6 +144,9 @@ if [[ "$BENCHMARK" == "true" ]]; then
     DATASET_FLAGS="$DATASET_FLAGS --dataset $DS"
   done
 
+  FAST_REFINE_FLAG=""
+  [[ "$FAST_REFINE" == "1" ]] && FAST_REFINE_FLAG="--fast-refine"
+
   "$PYTHON" -m dflash.benchmark_ssd_dflash \
     --model "$MODEL" \
     --draft-model "$DRAFT" \
@@ -154,7 +158,8 @@ if [[ "$BENCHMARK" == "true" ]]; then
     --acceptance-strategy "$ACCEPTANCE_STRATEGY" \
     --target-gpu "$TARGET_GPU" \
     --draft-gpu "$DRAFT_GPU" \
-    --out-dir "$OUT_DIR"
+    --out-dir "$OUT_DIR" \
+    $FAST_REFINE_FLAG
 
   echo ""
   echo "Phase 1 complete. Results in $OUT_DIR/"

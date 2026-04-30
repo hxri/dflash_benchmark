@@ -135,6 +135,7 @@ def dflash_ssd_generate(
     mask_token_id: Optional[int] = None,
     fan_out: int = 2,
     acceptance_predictor: Optional[AcceptancePredictor] = None,
+    fast_refine: bool = False,
     return_stats: bool = False,
     monitor: Optional[LiveMonitor] = None,
     log_path: Optional[str] = None,
@@ -154,6 +155,10 @@ def dflash_ssd_generate(
     mask_token_id   Override mask token id
     fan_out         F: number of draft blocks to pre-speculate
     acceptance_predictor  AcceptancePredictor instance (created internally if None)
+    fast_refine     If True, after verify produces fresh H_t, run one additional
+                    DFlash pass with fresh H_t to fix stale-H quality degradation.
+                    Adds ~T_draft latency on top of T_wall but restores acceptance
+                    to standard DFlash levels.  Use when H_SIM < 0.85.
     return_stats    If True, attach per-step stats to result
     monitor         LiveMonitor instance for real-time display
     log_path        If set, append per-step stats as JSONL
@@ -381,18 +386,46 @@ def dflash_ssd_generate(
         # Cache lookup: was our acceptance_length one of the pre-speculated lengths?
         pre_blocks = pre_result["blocks"]  # {k_f: tokens_tensor}
         if acceptance_length in pre_blocks:
-            # HIT: use the pre-speculated block (drafted with stale H)
+            # HIT: pre-speculated block matches the actual acceptance length.
             pre_draft_tokens = pre_blocks[acceptance_length].to(target_device)
             cache_hit = True
         else:
-            # MISS: nearest fan-out key → still use it; target will verify and accept what fits
+            # MISS: use nearest fan-out key as fallback.
             nearest_k = min(pre_blocks.keys(), key=lambda k: abs(k - acceptance_length))
             pre_draft_tokens = pre_blocks[nearest_k].to(target_device)
             cache_hit = False
 
+        # ── Fast-refinement pass (optional) ──────────────
+        # When H_SIM is low (< ~0.85), the stale pre-draft has poor acceptance.
+        # One more DFlash forward with fresh H_fresh restores standard DFlash quality
+        # at the cost of ~T_draft extra latency (but we already hid T_draft once).
+        if fast_refine:
+            # Mirror what dflash_generate does: [last_tok, MASK*..] noise input.
+            refine_block_ids = torch.cat([
+                output_ids[:, start: start + 1],
+                torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=target_device),
+            ], dim=1)
+            refine_noise = target.model.embed_tokens(refine_block_ids)
+            H_fresh_d1 = H_fresh.to(draft_device, non_blocking=True)
+            ctx_len_fresh = H_fresh_d1.shape[1]
+            ctx_start_fresh = start - ctx_len_fresh
+            refine_pos = position_ids[
+                :, ctx_start_fresh : ctx_start_fresh + ctx_len_fresh + bs
+            ].to(draft_device)
+            refine_cache = DynamicCache()
+            refine_logits = draft_lm_head(draft_model(
+                target_hidden=H_fresh_d1,
+                noise_embedding=draft_embed(
+                    refine_block_ids.to(draft_device)
+                ),
+                position_ids=refine_pos,
+                past_key_values=refine_cache,
+                use_cache=True,
+                is_causal=False,
+            )[:, 1 - bs:, :])
+            pre_draft_tokens = sample(refine_logits).to(target_device)
+
         # Stale H for next step's pre-draft thread.
-        # _run_pre_draft recomputes ctx_start from H_prev_d1.shape[1] each time,
-        # so no pre_pos variable is needed here (Bug-1 fix removes that dependency).
         H_prev = H_fresh
         H_prev_d1 = H_prev.to(draft_device, non_blocking=True)
 
