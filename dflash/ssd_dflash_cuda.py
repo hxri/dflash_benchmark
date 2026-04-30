@@ -214,34 +214,89 @@ def dflash_ssd_generate(
     acceptance_lengths: list[int] = [1]
     step_stats_list: list[StepStats] = []
     step_idx = 0
+    # Logits at the bonus position from the previous verify step.
+    # Used to predict top-F bonus candidates for the NEXT step's pre-draft.
+    # Initialised to None; warmup step populates it before the main loop.
+    prev_bonus_logits: Optional[torch.Tensor] = None
 
     decode_start = time.perf_counter()
 
-    # Pre-speculate FIRST block (warmup — no parallelism on step 0).
-    # H_prev from prefill is the full prompt hidden state (shape [1, num_input, …]),
-    # so ctx_start = start - num_input = 0, matching dflash_generate's step-0 convention.
+    # Warmup: run one standard DFlash step (sequential, no parallelism).
+    # This gives us the first real pre_draft_tokens AND populates prev_bonus_logits
+    # so the main loop can do bonus-fan-out pre-speculation.
     H_prev_d1 = H_prev.to(draft_device, non_blocking=True)
-    draft_cache_pre = DynamicCache()
-    pre_block_ids = torch.cat([
-        output_ids[:, start: start + 1].to(draft_device),
+    _warmup_cache = DynamicCache()
+    _last_tok_d1 = output_ids[:, start: start + 1].to(draft_device)
+    _warmup_block = torch.cat([
+        _last_tok_d1,
         torch.full((1, block_size - 1), mask_token_id, dtype=torch.long, device=draft_device),
     ], dim=1)
-    pre_noise = draft_embed(pre_block_ids)
-    # Bug-1 fix (warmup): position IDs must span ctx_len + block_size positions.
-    # ctx_len = H_prev.shape[1] = num_input; ctx_start = start - num_input = 0.
     _ctx_len_init = H_prev_d1.shape[1]
-    _ctx_start_init = start - _ctx_len_init          # = 0 for first step
-    pre_pos_init = position_ids[:, _ctx_start_init : _ctx_start_init + _ctx_len_init + block_size].to(draft_device)
-    pre_logits = draft_lm_head(draft_model(
+    _ctx_start_init = start - _ctx_len_init  # = 0 for first step
+    _warmup_pos = position_ids[
+        :, _ctx_start_init : _ctx_start_init + _ctx_len_init + block_size
+    ].to(draft_device)
+    _warmup_logits = draft_lm_head(draft_model(
         target_hidden=H_prev_d1,
-        noise_embedding=pre_noise,
-        position_ids=pre_pos_init,
-        past_key_values=draft_cache_pre,
+        noise_embedding=draft_embed(_warmup_block),
+        position_ids=_warmup_pos,
+        past_key_values=_warmup_cache,
         use_cache=True,
         is_causal=False,
     )[:, 1 - block_size:, :])
-    draft_cache_pre.crop(start)
-    pre_draft_tokens = sample(pre_logits).to(target_device)  # [1, block_size-1]
+    _warmup_cache.crop(start)
+    pre_draft_tokens = sample(_warmup_logits).to(target_device)  # [1, block_size-1]
+
+    # Run warmup verify to get the first prev_bonus_logits before the main loop.
+    # (Target is called sequentially here; parallelism starts from step 2.)
+    _warmup_verify_block = torch.cat([
+        output_ids[:, start: start + 1],
+        pre_draft_tokens[:, : block_size - 1],
+    ], dim=1)
+    _warmup_out = target(
+        _warmup_verify_block,
+        position_ids=position_ids[:, start: start + block_size],
+        past_key_values=target_cache,
+        use_cache=True,
+        output_hidden_states=True,
+    )
+    _warmup_posterior = sample(_warmup_out.logits, temperature)
+    _warmup_acc = int(
+        (_warmup_verify_block[:, 1:] == _warmup_posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0]
+    )
+    output_ids[:, start: start + _warmup_acc + 1] = _warmup_verify_block[:, :_warmup_acc + 1]
+    output_ids[:, start + _warmup_acc + 1] = _warmup_posterior[:, _warmup_acc]
+    start += _warmup_acc + 1
+    target_cache.crop(start)
+    acceptance_lengths.append(_warmup_acc + 1)
+    H_prev = extract_context_feature(
+        _warmup_out.hidden_states, draft_model.target_layer_ids
+    )[:, :_warmup_acc + 1, :].detach()
+    # prev_bonus_logits: the target's distribution at the bonus position from this warmup verify.
+    # Used in step 1 to predict the top-F bonus candidates for the NEXT block.
+    prev_bonus_logits = _warmup_out.logits[:, _warmup_acc, :].detach()
+    H_prev_d1 = H_prev.to(draft_device, non_blocking=True)
+
+    # Compute the first real pre_draft using the warmup bonus as last_tok.
+    _ctx_len = H_prev_d1.shape[1]
+    _ctx_start = start - _ctx_len
+    _bonus_tok = output_ids[:, start: start + 1].to(draft_device)
+    _first_block = torch.cat([
+        _bonus_tok,
+        torch.full((1, block_size - 1), mask_token_id, dtype=torch.long, device=draft_device),
+    ], dim=1)
+    _first_cache = DynamicCache()
+    _first_pos = position_ids[:, _ctx_start : _ctx_start + _ctx_len + block_size].to(draft_device)
+    _first_logits = draft_lm_head(draft_model(
+        target_hidden=H_prev_d1,
+        noise_embedding=draft_embed(_first_block),
+        position_ids=_first_pos,
+        past_key_values=_first_cache,
+        use_cache=True,
+        is_causal=False,
+    )[:, 1 - block_size:, :])
+    _first_cache.crop(start)
+    pre_draft_tokens = sample(_first_logits).to(target_device)
 
     # ── Main decode loop ──────────────────────────────────
     while start < max_length:
@@ -250,7 +305,13 @@ def dflash_ssd_generate(
             break
 
         step_idx += 1
-        top_f = acceptance_predictor.top_k(fan_out)
+
+        # Bonus-fan-out: predict the top-F most likely bonus tokens for the
+        # NEXT step using the target's logits at the previous bonus position.
+        # Pre-speculate one draft per candidate so we have a correct first token.
+        bonus_candidates = torch.topk(
+            prev_bonus_logits[0], k=fan_out, dim=-1
+        ).indices.tolist()  # list[int], length = fan_out
 
         # Build the verify block from the pre-speculated draft
         verify_block = torch.cat([
@@ -261,14 +322,14 @@ def dflash_ssd_generate(
 
         # ── Async launch ─────────────────────────────────
         # Thread A  (GPU 0): verify the current block
-        # Thread B  (GPU 1): pre-speculate draft for the NEXT step using stale H
+        # Thread B  (GPU 1): for each predicted bonus candidate, pre-speculate
+        #                    DFlash(H_prev, [candidate, MASK…]) — CORRECT first token!
 
         verify_result: dict = {}
         pre_result: dict = {}
 
         def _run_verify():
-            # torch.inference_mode() is thread-local — child threads do NOT inherit
-            # it from the spawning thread, so we must declare it explicitly here.
+            # torch.inference_mode() is thread-local — must be declared inside thread.
             with torch.inference_mode():
                 try:
                     torch.cuda.set_device(target_device)
@@ -290,7 +351,6 @@ def dflash_ssd_generate(
                     verify_result["exc"] = exc
 
         def _run_pre_draft():
-            # Same reason as above — declare inference_mode inside the thread.
             with torch.inference_mode():
                 try:
                     torch.cuda.set_device(draft_device)
@@ -299,22 +359,18 @@ def dflash_ssd_generate(
 
                     ev_s = torch.cuda.Event(enable_timing=True)
                     ev_e = torch.cuda.Event(enable_timing=True)
+                    # Cache keyed by BONUS TOKEN (int), not acceptance length.
                     blocks: dict[int, torch.Tensor] = {}
                     ev_s.record()
 
-                    for k_f in top_f:
-                        ctx_len_kf = min(k_f + 1, H_prev_len)
-                        h_ctx = H_prev_d1[:, :ctx_len_kf, :]
-
-                        kf_pos = position_ids[
-                            :, ctx_start : ctx_start + ctx_len_kf + bs
-                        ].to(draft_device, non_blocking=True)
-
-                        first_d1 = output_ids[:, start: start + 1].to(
-                            draft_device, non_blocking=True
+                    for bonus_cand in bonus_candidates:
+                        # Use the predicted bonus as position 0 — this is the
+                        # key fix: correct first token, stale H.
+                        cand_tok = torch.tensor(
+                            [[bonus_cand]], dtype=torch.long, device=draft_device
                         )
                         blk = torch.cat([
-                            first_d1,
+                            cand_tok,
                             torch.full(
                                 (1, bs - 1), mask_token_id,
                                 dtype=torch.long, device=draft_device,
@@ -322,16 +378,21 @@ def dflash_ssd_generate(
                         ], dim=1)
                         noise = draft_embed(blk)
 
+                        ctx_len_this = H_prev_len
+                        kf_pos = position_ids[
+                            :, ctx_start : ctx_start + ctx_len_this + bs
+                        ].to(draft_device, non_blocking=True)
+
                         tmp_cache = DynamicCache()
                         logits_d = draft_lm_head(draft_model(
-                            target_hidden=h_ctx,
+                            target_hidden=H_prev_d1,
                             noise_embedding=noise,
                             position_ids=kf_pos,
                             past_key_values=tmp_cache,
                             use_cache=True,
                             is_causal=False,
                         )[:, 1 - bs:, :])
-                        blocks[k_f] = sample(logits_d)
+                        blocks[bonus_cand] = sample(logits_d)
 
                     ev_e.record()
                     torch.cuda.synchronize(draft_device)
@@ -371,59 +432,74 @@ def dflash_ssd_generate(
         target_cache.crop(start)
         acceptance_lengths.append(acceptance_length + 1)
 
-        # Update acceptance predictor
-        acceptance_predictor.update(acceptance_length)
-
-        # Fresh hidden states (on target device)
+        # Fresh hidden states
         H_fresh = extract_context_feature(
             v_out.hidden_states, draft_model.target_layer_ids
         )[:, :acceptance_length + 1, :].detach()
 
-        # Cosine similarity between stale and fresh H
         h_sim = _cosine_sim(H_prev, H_fresh)
 
-        # ── Select next draft block ───────────────────────
-        # Cache lookup: was our acceptance_length one of the pre-speculated lengths?
-        pre_blocks = pre_result["blocks"]  # {k_f: tokens_tensor}
-        if acceptance_length in pre_blocks:
-            # HIT: pre-speculated block matches the actual acceptance length.
-            pre_draft_tokens = pre_blocks[acceptance_length].to(target_device)
+        # ── Bonus-fan-out cache lookup ────────────────────
+        # The actual bonus token is `output_ids[start]` (just committed above).
+        actual_bonus = int(output_ids[0, start - 1].item())  # new last_tok
+        pre_blocks = pre_result["blocks"]  # {bonus_candidate: draft_tokens}
+
+        if actual_bonus in pre_blocks:
+            # HIT: a pre-draft with the correct first token is ready.
+            pre_draft_tokens = pre_blocks[actual_bonus].to(target_device)
             cache_hit = True
         else:
-            # MISS: use nearest fan-out key as fallback.
-            nearest_k = min(pre_blocks.keys(), key=lambda k: abs(k - acceptance_length))
-            pre_draft_tokens = pre_blocks[nearest_k].to(target_device)
+            # MISS: none of the predicted bonuses matched.
+            # Fall back: run one DFlash pass with stale H + correct first token.
+            # This is sequential (~T_draft overhead) but produces a good draft.
+            miss_tok_d1 = output_ids[:, start - 1: start].to(draft_device)
+            miss_blk = torch.cat([
+                miss_tok_d1,
+                torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=draft_device),
+            ], dim=1)
+            _ctx_len_miss = H_prev_d1.shape[1]
+            _ctx_start_miss = (start - 1) - _ctx_len_miss
+            miss_pos = position_ids[
+                :, _ctx_start_miss : _ctx_start_miss + _ctx_len_miss + bs
+            ].to(draft_device)
+            miss_cache = DynamicCache()
+            miss_logits = draft_lm_head(draft_model(
+                target_hidden=H_prev_d1,
+                noise_embedding=draft_embed(miss_blk),
+                position_ids=miss_pos,
+                past_key_values=miss_cache,
+                use_cache=True,
+                is_causal=False,
+            )[:, 1 - bs:, :])
+            pre_draft_tokens = sample(miss_logits).to(target_device)
             cache_hit = False
 
-        # ── Fast-refinement pass (optional) ──────────────
-        # When H_SIM is low (< ~0.85), the stale pre-draft has poor acceptance.
-        # One more DFlash forward with fresh H_fresh restores standard DFlash quality
-        # at the cost of ~T_draft extra latency (but we already hid T_draft once).
+        # ── Optional fast-refine with fresh H ────────────
         if fast_refine:
-            # Mirror what dflash_generate does: [last_tok, MASK*..] noise input.
-            refine_block_ids = torch.cat([
-                output_ids[:, start: start + 1],
-                torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=target_device),
+            refine_tok_d1 = output_ids[:, start - 1: start].to(draft_device)
+            refine_blk = torch.cat([
+                refine_tok_d1,
+                torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=draft_device),
             ], dim=1)
-            refine_noise = target.model.embed_tokens(refine_block_ids)
             H_fresh_d1 = H_fresh.to(draft_device, non_blocking=True)
-            ctx_len_fresh = H_fresh_d1.shape[1]
-            ctx_start_fresh = start - ctx_len_fresh
+            _ctx_len_rf = H_fresh_d1.shape[1]
+            _ctx_start_rf = (start - 1) - _ctx_len_rf
             refine_pos = position_ids[
-                :, ctx_start_fresh : ctx_start_fresh + ctx_len_fresh + bs
+                :, _ctx_start_rf : _ctx_start_rf + _ctx_len_rf + bs
             ].to(draft_device)
             refine_cache = DynamicCache()
             refine_logits = draft_lm_head(draft_model(
                 target_hidden=H_fresh_d1,
-                noise_embedding=draft_embed(
-                    refine_block_ids.to(draft_device)
-                ),
+                noise_embedding=draft_embed(refine_blk),
                 position_ids=refine_pos,
                 past_key_values=refine_cache,
                 use_cache=True,
                 is_causal=False,
             )[:, 1 - bs:, :])
             pre_draft_tokens = sample(refine_logits).to(target_device)
+
+        # Update prev_bonus_logits for next step's bonus prediction.
+        prev_bonus_logits = v_out.logits[:, acceptance_length, :].detach()
 
         # Stale H for next step's pre-draft thread.
         H_prev = H_fresh
@@ -439,7 +515,7 @@ def dflash_ssd_generate(
             acceptance_len=acceptance_length + 1,
             block_size=bs,
             h_cosine_sim=h_sim,
-            fan_out_lengths=top_f,
+            fan_out_lengths=bonus_candidates,
         )
         step_stats_list.append(ss)
         if monitor is not None:

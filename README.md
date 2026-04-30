@@ -172,3 +172,6 @@ If you find DFlash useful, please cite our work. To share feedback on DFlash or 
   year    = {2026}
 }
 ```
+MODEL=Qwen/Qwen3-4B DRAFT=z-lab/Qwen3-4B-DFlash-b16 FAN_OUT=2 MAX_SAMPLES=128 TARGET_GPU=0 DRAFT_GPU=1 DATASETS=alpaca ./run_ssd_dflash.sh --benchmark-only
+
+MODEL=Qwen/Qwen3-4B DRAFT=z-lab/Qwen3-4B-DFlash-b16 FAN_OUT=2 MAX_SAMPLES=128 TARGET_GPU=0 DRAFT_GPU=1 DATASETS="alpaca ultrafeedback mt-bench" ./run_ssd_dflash.sh --benchmark-only
