@@ -485,20 +485,33 @@ def sd_generate(
     speculation_fanout: int = 2,
     return_stats: bool = False,
 ):
-    """Standard speculative decoding with an autoregressive LM as draft.
+    """Speculative decoding with SAGUARO-style speculation cache and O(n) draft cost.
 
-    Implements the batch-verification algorithm: draft model generates
-    num_draft_tokens autoregressively, target verifies all in one forward
-    pass, longest matching prefix is accepted plus one bonus token.
+    Main path uses a persistent draft KV cache (O(1) per step).
+    Speculation cache branches use fresh caches — that is acceptable because
+    each branch only processes a handful of new tokens beyond the branch point.
+
+    Algorithm per step:
+      1. If speculation cache hit: retrieve pre-generated draft; advance draft
+         KV cache by feeding curr_tok + accepted tokens (O(accepted) passes).
+      2. On miss: generate draft tokens incrementally from persistent cache
+         (O(num_draft_tokens) passes, no full-prefix rebuild).
+      3. Build next-step speculation cache for (accepted, bonus) outcomes.
+      4. Verify with target; crop both KV caches to accepted prefix.
     """
     num_input = input_ids.shape[1]
     device = input_ids.device
 
     target_cache = DynamicCache()
+    # Persistent draft cache — avoids the O(n²) full-prefix rebuild on every step.
+    draft_cache = DynamicCache()
 
     prefill_start = _cuda_time() if return_stats else None
 
     t_out = target(input_ids, past_key_values=target_cache, use_cache=True, logits_to_keep=1)
+    # Prefill draft on the same prompt so its KV cache is warmed up.
+    draft(input_ids, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
+
     first_tok = int(sample(t_out.logits[:, -1:], temperature)[0, 0])
 
     time_to_first_token = (_cuda_time() - prefill_start) if return_stats else None
@@ -507,52 +520,68 @@ def sd_generate(
     output = [first_tok]
     acceptance_lengths = [1]
     target_cache_pos = num_input
+    draft_cache_pos = num_input   # mirrors draft_cache.get_seq_length()
     prefetched_entry: Optional[SDPrefetchEntry] = None
 
     while len(output) < max_new_tokens:
-        committed_output = list(output)
+        committed_output = list(output)   # snapshot before this step adds tokens
         curr_tok = output[-1]
         curr_tensor = torch.tensor([[curr_tok]], dtype=torch.long, device=device)
         n = min(num_draft_tokens, max_new_tokens - len(output))
         old_target_pos = target_cache_pos
+        old_draft_pos = draft_cache_pos
 
         if prefetched_entry is None or len(prefetched_entry.draft_ids) < n:
-            prefix_ids = torch.cat(
-                [input_ids, torch.tensor([committed_output], dtype=torch.long, device=device)],
-                dim=1,
-            )
-            current_entry = _generate_sd_prefetch_entry(
-                draft,
-                prefix_ids,
-                num_draft_tokens=n,
-                temperature=temperature,
-            )
+            # ── Fresh draft via persistent cache (O(n_draft) per step) ──────
+            d_out = draft(curr_tensor, past_key_values=draft_cache,
+                          use_cache=True, logits_to_keep=1)
+            draft_cache_pos += 1
+
+            draft_ids: list[int] = []
+            step_logits: list[torch.Tensor] = [d_out.logits[:, -1:]]
+            d_logits = d_out.logits[:, -1:]
+            for i in range(n):
+                tok = int(sample(d_logits, temperature)[0, 0])
+                draft_ids.append(tok)
+                if i < n - 1:
+                    d_out = draft(
+                        torch.tensor([[tok]], dtype=torch.long, device=device),
+                        past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
+                    )
+                    d_logits = d_out.logits[:, -1:]
+                    step_logits.append(d_logits)
+                    draft_cache_pos += 1
+            step_logits.append(d_logits)  # prediction after last draft token
+            current_entry = SDPrefetchEntry(draft_ids=draft_ids, step_logits=step_logits)
+            used_fresh = True
         else:
             current_entry = prefetched_entry
+            used_fresh = False
 
-        draft_ids = current_entry.draft_ids[:n]
+        draft_ids_used = current_entry.draft_ids[:n]
 
-        # --- Verify phase: feed curr_tok + all n draft tokens = n+1 tokens ---
+        # ── Verify ───────────────────────────────────────────────────────────
         verify_input = torch.cat(
-            [curr_tensor, torch.tensor([draft_ids], dtype=torch.long, device=device)], dim=1
+            [curr_tensor, torch.tensor([draft_ids_used], dtype=torch.long, device=device)],
+            dim=1,
         )
         t_out = target(verify_input, past_key_values=target_cache, use_cache=True)
         target_cache_pos += n + 1
         t_preds = sample(t_out.logits, temperature)[0].tolist()
 
-        # Find acceptance length
         accepted = 0
         for i in range(n):
-            if draft_ids[i] == t_preds[i]:
+            if draft_ids_used[i] == t_preds[i]:
                 accepted += 1
             else:
                 break
 
         bonus = t_preds[accepted]
-        new_toks = (draft_ids[:accepted] + [bonus])[: max_new_tokens - len(output)]
+        new_toks = (draft_ids_used[:accepted] + [bonus])[: max_new_tokens - len(output)]
         output.extend(new_toks)
         acceptance_lengths.append(len(new_toks))
 
+        # ── Speculation cache for next step ───────────────────────────────────
         next_round_cache = _build_sd_outcome_cache(
             draft,
             input_ids,
@@ -564,10 +593,30 @@ def sd_generate(
             speculation_fanout=speculation_fanout,
         )
 
-        # --- KV cache rollback ---
-        # Target: keep old + accepted + 1 (curr_tok + accepted drafts)
+        # ── KV cache rollback ─────────────────────────────────────────────────
+        # Target: keep old + accepted + 1 (curr_tok + accepted draft tokens).
         target_cache.crop(old_target_pos + accepted + 1)
         target_cache_pos = old_target_pos + accepted + 1
+
+        # Draft persistent cache rollback.
+        if used_fresh:
+            # We fed: curr_tok (1) + draft_ids[:n-1] (n-1) = n tokens total.
+            # Keep only up to old + accepted + 1 (curr_tok + accepted drafts).
+            # DynamicCache.crop is a no-op when target > current length, so
+            # accepted == n is handled correctly.
+            draft_cache.crop(old_draft_pos + accepted + 1)
+            draft_cache_pos = old_draft_pos + accepted + 1
+        else:
+            # Speculation-cache hit: draft cache was NOT advanced this step.
+            # Feed curr_tok + draft_ids_used[:accepted] to catch up.
+            # Cost: O(accepted + 1) single-token passes — fast on GPU.
+            toks_to_feed = [curr_tok] + list(draft_ids_used[:accepted])
+            for tok in toks_to_feed:
+                draft(
+                    torch.tensor([[tok]], dtype=torch.long, device=device),
+                    past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
+                )
+                draft_cache_pos += 1
 
         prefetched_entry = next_round_cache.get((accepted, bonus))
 
