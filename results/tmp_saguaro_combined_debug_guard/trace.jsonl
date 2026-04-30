@@ -1,0 +1,2 @@
+{"request_id": "gsm8k:0", "step_idx": 0, "accepted_tokens": 5, "proposed_tokens": 16, "acceptance_ratio": 0.3125, "step_ms": 296.05811298824847, "cumulative_decode_tokens": 5, "cumulative_decode_tps": 11.88917313065632, "cache_hit": false, "hidden_drift_cosine": 0.6317571401596069}
+{"request_id": "gsm8k:0", "step_idx": 1, "accepted_tokens": 1, "proposed_tokens": 16, "acceptance_ratio": 0.0625, "step_ms": 102.03896183520555, "cumulative_decode_tokens": 6, "cumulative_decode_tps": 11.473466996596699, "cache_hit": false, "hidden_drift_cosine": 0.7765647172927856}

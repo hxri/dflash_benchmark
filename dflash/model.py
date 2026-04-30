@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass
 import torch
 from types import SimpleNamespace
 from typing import Callable, Optional
@@ -57,6 +58,112 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 def _cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
+
+
+@dataclass
+class SDPrefetchEntry:
+    draft_ids: list[int]
+    step_logits: list[torch.Tensor]
+
+
+def _top_candidate_tokens(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    exclude_token: Optional[int] = None,
+) -> list[int]:
+    if top_k <= 0:
+        return []
+    logits_1d = logits[0, 0]
+    fetch_k = min(logits_1d.shape[0], top_k + (1 if exclude_token is not None else 0))
+    tokens = torch.topk(logits_1d, k=fetch_k).indices.tolist()
+    if exclude_token is not None:
+        tokens = [token for token in tokens if token != exclude_token]
+    return tokens[:top_k]
+
+
+def _generate_sd_prefetch_entry(
+    draft: nn.Module,
+    prefix_ids: torch.LongTensor,
+    *,
+    num_draft_tokens: int,
+    temperature: float,
+) -> SDPrefetchEntry:
+    if num_draft_tokens <= 0:
+        return SDPrefetchEntry(draft_ids=[], step_logits=[])
+
+    draft_cache = DynamicCache()
+    draft_output = draft(prefix_ids, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
+    current_logits = draft_output.logits[:, -1:, :].detach()
+
+    draft_ids: list[int] = []
+    step_logits: list[torch.Tensor] = []
+    device = prefix_ids.device
+
+    for _ in range(num_draft_tokens):
+        step_logits.append(current_logits)
+        token = int(sample(current_logits, temperature)[0, 0].item())
+        draft_ids.append(token)
+        draft_output = draft(
+            torch.tensor([[token]], dtype=torch.long, device=device),
+            past_key_values=draft_cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        current_logits = draft_output.logits[:, -1:, :].detach()
+
+    step_logits.append(current_logits)
+    return SDPrefetchEntry(draft_ids=draft_ids, step_logits=step_logits)
+
+
+def _build_sd_outcome_cache(
+    draft: nn.Module,
+    input_ids: torch.LongTensor,
+    committed_output: list[int],
+    current_entry: SDPrefetchEntry,
+    *,
+    max_new_tokens: int,
+    num_draft_tokens: int,
+    temperature: float,
+    speculation_fanout: int,
+) -> dict[tuple[int, int], SDPrefetchEntry]:
+    if not current_entry.draft_ids or speculation_fanout <= 0:
+        return {}
+
+    device = input_ids.device
+    prefix_ids = torch.cat(
+        [input_ids, torch.tensor([committed_output], dtype=torch.long, device=device)],
+        dim=1,
+    )
+    outcome_cache: dict[tuple[int, int], SDPrefetchEntry] = {}
+    num_steps = len(current_entry.draft_ids)
+
+    for accepted in range(num_steps + 1):
+        candidate_logits = current_entry.step_logits[accepted]
+        exclude_token = current_entry.draft_ids[accepted] if accepted < num_steps else None
+        bonus_candidates = _top_candidate_tokens(
+            candidate_logits,
+            top_k=speculation_fanout,
+            exclude_token=exclude_token,
+        )
+        for bonus_token in bonus_candidates:
+            branch_tokens = current_entry.draft_ids[:accepted] + [bonus_token]
+            branch_prefix = torch.cat(
+                [prefix_ids, torch.tensor([branch_tokens], dtype=torch.long, device=device)],
+                dim=1,
+            )
+            remaining_tokens = max_new_tokens - (len(committed_output) + len(branch_tokens))
+            branch_lookahead = min(num_draft_tokens, remaining_tokens)
+            if branch_lookahead <= 0:
+                continue
+            outcome_cache[(accepted, bonus_token)] = _generate_sd_prefetch_entry(
+                draft,
+                branch_prefix,
+                num_draft_tokens=branch_lookahead,
+                temperature=temperature,
+            )
+
+    return outcome_cache
 
 
 @torch.inference_mode()
@@ -375,6 +482,7 @@ def sd_generate(
     stop_token_ids: Optional[list[int]],
     temperature: float,
     num_draft_tokens: int = 5,
+    speculation_fanout: int = 2,
     return_stats: bool = False,
 ):
     """Standard speculative decoding with an autoregressive LM as draft.
@@ -387,12 +495,10 @@ def sd_generate(
     device = input_ids.device
 
     target_cache = DynamicCache()
-    draft_cache = DynamicCache()
 
     prefill_start = _cuda_time() if return_stats else None
 
     t_out = target(input_ids, past_key_values=target_cache, use_cache=True, logits_to_keep=1)
-    draft(input_ids, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
     first_tok = int(sample(t_out.logits[:, -1:], temperature)[0, 0])
 
     time_to_first_token = (_cuda_time() - prefill_start) if return_stats else None
@@ -400,32 +506,31 @@ def sd_generate(
 
     output = [first_tok]
     acceptance_lengths = [1]
-    # target_cache_pos: tokens in target KV cache (= num_input after prefill)
-    # draft_cache_pos: tokens in draft KV cache (= num_input after prefill)
     target_cache_pos = num_input
-    draft_cache_pos = num_input
+    prefetched_entry: Optional[SDPrefetchEntry] = None
 
     while len(output) < max_new_tokens:
+        committed_output = list(output)
         curr_tok = output[-1]
         curr_tensor = torch.tensor([[curr_tok]], dtype=torch.long, device=device)
         n = min(num_draft_tokens, max_new_tokens - len(output))
-        old_draft_pos = draft_cache_pos
         old_target_pos = target_cache_pos
 
-        # --- Draft phase: feed curr_tok then generate n draft tokens ---
-        # After the loop we will have fed: curr_tok + draft_ids[0:n-2] = n tokens
-        d_out = draft(curr_tensor, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
-        draft_cache_pos += 1
-        draft_ids = []
-        for i in range(n):
-            tok = int(sample(d_out.logits[:, -1:], temperature)[0, 0])
-            draft_ids.append(tok)
-            if i < n - 1:
-                d_out = draft(
-                    torch.tensor([[tok]], dtype=torch.long, device=device),
-                    past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
-                )
-                draft_cache_pos += 1
+        if prefetched_entry is None or len(prefetched_entry.draft_ids) < n:
+            prefix_ids = torch.cat(
+                [input_ids, torch.tensor([committed_output], dtype=torch.long, device=device)],
+                dim=1,
+            )
+            current_entry = _generate_sd_prefetch_entry(
+                draft,
+                prefix_ids,
+                num_draft_tokens=n,
+                temperature=temperature,
+            )
+        else:
+            current_entry = prefetched_entry
+
+        draft_ids = current_entry.draft_ids[:n]
 
         # --- Verify phase: feed curr_tok + all n draft tokens = n+1 tokens ---
         verify_input = torch.cat(
@@ -448,21 +553,23 @@ def sd_generate(
         output.extend(new_toks)
         acceptance_lengths.append(len(new_toks))
 
+        next_round_cache = _build_sd_outcome_cache(
+            draft,
+            input_ids,
+            committed_output,
+            current_entry,
+            max_new_tokens=max_new_tokens,
+            num_draft_tokens=num_draft_tokens,
+            temperature=temperature,
+            speculation_fanout=speculation_fanout,
+        )
+
         # --- KV cache rollback ---
         # Target: keep old + accepted + 1 (curr_tok + accepted drafts)
         target_cache.crop(old_target_pos + accepted + 1)
         target_cache_pos = old_target_pos + accepted + 1
 
-        # Draft: loop fed curr_tok + draft_ids[0:n-2] (n tokens total = old+n)
-        # accepted < n-1: over-fed, crop; accepted==n: under-fed d[n-1], feed it
-        if accepted < n - 1:
-            draft_cache.crop(old_draft_pos + accepted + 1)
-        elif accepted == n:
-            draft(
-                torch.tensor([[draft_ids[-1]]], dtype=torch.long, device=device),
-                past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
-            )
-        draft_cache_pos = old_draft_pos + accepted + 1
+        prefetched_entry = next_round_cache.get((accepted, bonus))
 
         if stop_token_ids and any(t in output for t in stop_token_ids):
             break

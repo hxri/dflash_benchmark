@@ -1,0 +1,1 @@
+{"request_id": "gsm8k:0", "dataset": "gsm8k", "input_tokens": 96, "output_tokens": 32, "time_to_first_token": 0.39812054205685854, "time_per_output_token": 0.16445939390541753, "decode_tps": 6.08052830703676, "mean_acceptance_tokens": 3.2, "p10_acceptance_tokens": 1.0, "mean_hidden_drift": null, "stop_reason": "max_new_tokens", "cache_hits": 6, "cache_total": 9}

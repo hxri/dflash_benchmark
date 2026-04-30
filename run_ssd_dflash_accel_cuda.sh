@@ -17,14 +17,15 @@ set -euo pipefail
 
 PYTHON=".venv-cuda/bin/python"
 
-MODEL="${MODEL:-Qwen/Qwen3-8B}"
-DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}"
+MODEL="${MODEL:-Qwen/Qwen3-4B}"
+DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3-4B-DFlash-b16}"
 DATASET="${DATASET:-gsm8k}"
 MAX_SAMPLES="${MAX_SAMPLES:-64}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MONITOR_EVERY="${MONITOR_EVERY:-8}"
+SPECULATION_FANOUT="${SPECULATION_FANOUT:-2}"
 NPROC="${NPROC:-2}"
 ENABLE_THINKING="${ENABLE_THINKING:-0}"
 LIVE_MONITOR="${LIVE_MONITOR:-1}"
@@ -35,10 +36,12 @@ if [[ ! -f "$PYTHON" ]]; then
     exit 1
 fi
 
-if ! "$PYTHON" -c "import flash_attn" >/dev/null 2>&1; then
-    echo "ERROR: flash-attn is required but not installed in .venv-cuda"
-    echo "Install with: .venv-cuda/bin/pip install flash-attn --no-build-isolation"
-    exit 1
+ATTN_IMPL="sdpa"
+if "$PYTHON" -c "import flash_attn" >/dev/null 2>&1; then
+    ATTN_IMPL="flash_attention_2"
+else
+    echo "WARNING: flash-attn is not installed in .venv-cuda. Falling back to torch.sdpa."
+    echo "         Throughput may be lower than flash-attn."
 fi
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
@@ -61,7 +64,7 @@ if [[ "$WRITE_TEXT_OUTPUTS" == "1" ]]; then
 fi
 
 echo "============================================================"
-echo "SSD+DFlash Accelerated Decode (CUDA / flash-attn)"
+echo "SSD+DFlash Accelerated Decode (CUDA / ${ATTN_IMPL})"
 echo "============================================================"
 echo "Model:           $MODEL"
 echo "DFlash draft:    $DRAFT_MODEL"
@@ -70,6 +73,7 @@ echo "Max samples:     $MAX_SAMPLES"
 echo "Max new tokens:  $MAX_NEW_TOKENS"
 echo "Temperature:     $TEMPERATURE"
 echo "Block size:      $BLOCK_SIZE"
+echo "Spec fan-out:    $SPECULATION_FANOUT"
 echo "NPROC:           $NPROC"
 echo "Output dir:      $OUT_DIR"
 echo "============================================================"
@@ -84,6 +88,7 @@ torchrun --nproc_per_node="$NPROC" -m dflash.ssd_dflash_accel \
     --temperature "$TEMPERATURE" \
     --block-size "$BLOCK_SIZE" \
     --monitor-every "$MONITOR_EVERY" \
+    --speculation-fanout "$SPECULATION_FANOUT" \
     --out-dir "$OUT_DIR" \
     $THINK_FLAG \
     $MONITOR_FLAG \

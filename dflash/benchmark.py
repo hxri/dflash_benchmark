@@ -312,6 +312,7 @@ def _run_transformers(args: argparse.Namespace) -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                     num_draft_tokens=num_draft_tokens,
+                    speculation_fanout=args.speculation_fanout,
                     return_stats=True,
                 )
 
@@ -589,6 +590,8 @@ def main() -> None:
                         help="Standard LM draft for Spec-SD baseline comparison (e.g. Qwen/Qwen3-0.6B)")
     parser.add_argument("--num-draft-tokens", type=int, default=5,
                         help="Draft tokens per verify step for Spec-SD baseline (default: 5)")
+    parser.add_argument("--speculation-fanout", type=int, default=2,
+                        help="How many likely verification outcomes to prefetch for the next round")
 
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000")
     parser.add_argument("--num-prompts", type=int, default=1024)

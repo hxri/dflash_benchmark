@@ -58,6 +58,15 @@ class SampleSummary:
     stop_reason: str
 
 
+@dataclass
+class DFlashPrefetchEntry:
+    block_output_ids: torch.Tensor
+    source_target_hidden: torch.Tensor
+    draft_hidden: torch.Tensor
+    draft_logits: torch.Tensor
+    next_bonus_logits: torch.Tensor
+
+
 def _cuda_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
@@ -108,16 +117,139 @@ def _safe_cosine(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> Option
     return float(F.cosine_similarity(a.float(), b.float(), dim=-1).mean().item())
 
 
-def _check_flash_attn_required() -> str:
+def _top_candidate_tokens(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    exclude_token: Optional[int] = None,
+) -> list[int]:
+    if top_k <= 0:
+        return []
+    logits_1d = logits[0, 0]
+    fetch_k = min(logits_1d.shape[0], top_k + (1 if exclude_token is not None else 0))
+    tokens = torch.topk(logits_1d, k=fetch_k).indices.tolist()
+    if exclude_token is not None:
+        tokens = [token for token in tokens if token != exclude_token]
+    return tokens[:top_k]
+
+
+def _generate_dflash_prefetch_entry(
+    model: DFlashDraftModel,
+    target: torch.nn.Module,
+    target_hidden: torch.Tensor,
+    *,
+    first_token: int,
+    block_len: int,
+    mask_token_id: int,
+    start_position: int,
+    temperature: float,
+) -> DFlashPrefetchEntry:
+    device = target.device
+    vocab_size = target.lm_head.weight.shape[0]
+    block_output_ids = torch.full(
+        (1, block_len),
+        mask_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    block_output_ids[:, 0] = first_token
+    noise_embedding = target.model.embed_tokens(block_output_ids)
+    block_position_ids = torch.arange(
+        start_position - target_hidden.shape[1],
+        start_position + block_len,
+        device=device,
+    ).unsqueeze(0)
+
+    draft_hidden = model(
+        target_hidden=target_hidden,
+        noise_embedding=noise_embedding,
+        position_ids=block_position_ids,
+        past_key_values=DynamicCache(),
+        use_cache=True,
+        is_causal=False,
+    )[:, 1 - block_len :, :].detach()
+
+    if block_len > 1:
+        draft_logits = target.lm_head(draft_hidden[:, : block_len - 1, :]).detach()
+        block_output_ids[:, 1:block_len] = sample(draft_logits, temperature)
+    else:
+        draft_logits = torch.empty((1, 0, vocab_size), dtype=target.lm_head.weight.dtype, device=device)
+
+    next_bonus_logits = target.lm_head(draft_hidden[:, -1:, :]).detach()
+    return DFlashPrefetchEntry(
+        block_output_ids=block_output_ids,
+        source_target_hidden=target_hidden.detach(),
+        draft_hidden=draft_hidden,
+        draft_logits=draft_logits,
+        next_bonus_logits=next_bonus_logits,
+    )
+
+
+def _build_dflash_outcome_cache(
+    model: DFlashDraftModel,
+    target: torch.nn.Module,
+    current_entry: DFlashPrefetchEntry,
+    *,
+    generated_before_round: int,
+    max_new_tokens: int,
+    block_size: int,
+    mask_token_id: int,
+    start_position: int,
+    temperature: float,
+    speculation_fanout: int,
+) -> dict[tuple[int, int], DFlashPrefetchEntry]:
+    if speculation_fanout <= 0:
+        return {}
+
+    block_len = current_entry.block_output_ids.shape[1]
+    outcome_cache: dict[tuple[int, int], DFlashPrefetchEntry] = {}
+
+    for accepted_tokens in range(1, block_len + 1):
+        remaining_tokens = max_new_tokens - (generated_before_round + accepted_tokens)
+        next_block_len = min(block_size, remaining_tokens)
+        if next_block_len <= 0:
+            continue
+
+        if accepted_tokens < block_len:
+            candidate_logits = current_entry.draft_logits[:, accepted_tokens - 1 : accepted_tokens, :]
+            exclude_token = int(current_entry.block_output_ids[0, accepted_tokens].item())
+        else:
+            candidate_logits = current_entry.next_bonus_logits
+            exclude_token = None
+
+        bonus_candidates = _top_candidate_tokens(
+            candidate_logits,
+            top_k=speculation_fanout,
+            exclude_token=exclude_token,
+        )
+        surrogate_hidden = current_entry.source_target_hidden
+
+        for bonus_token in bonus_candidates:
+            outcome_cache[(accepted_tokens, bonus_token)] = _generate_dflash_prefetch_entry(
+                model,
+                target,
+                surrogate_hidden,
+                first_token=bonus_token,
+                block_len=next_block_len,
+                mask_token_id=mask_token_id,
+                start_position=start_position + accepted_tokens,
+                temperature=temperature,
+            )
+
+    return outcome_cache
+
+
+def _resolve_attn_impl() -> str:
     try:
         import flash_attn  # noqa: F401
 
         return "flash_attention_2"
-    except ImportError as exc:
-        raise RuntimeError(
-            "flash-attn is required for this SSD+DFlash CUDA runtime. "
-            "Install with: .venv-cuda/bin/pip install flash-attn --no-build-isolation"
-        ) from exc
+    except ImportError:
+        logger.warning(
+            "flash-attn not installed. Falling back to torch.sdpa for SSD+DFlash runtime. "
+            "Install for best performance: .venv-cuda/bin/pip install flash-attn --no-build-isolation"
+        )
+        return "sdpa"
 
 
 def _format_runtime_table(s: SampleSummary, block_size: int) -> Table:
@@ -150,6 +282,7 @@ def ssd_dflash_generate_monitored(
     request_id: str,
     monitor_every: int,
     live_monitor: bool,
+    speculation_fanout: int,
     trace_fh,
 ):
     num_input_tokens = input_ids.shape[1]
@@ -165,7 +298,6 @@ def ssd_dflash_generate_monitored(
     )
     position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
     target_cache = DynamicCache()
-    draft_cache = DynamicCache()
 
     prefill_start = _cuda_time()
     output = target(
@@ -194,30 +326,31 @@ def ssd_dflash_generate_monitored(
     traces: list[StepTrace] = []
     stop_reason = "max_new_tokens"
     step_idx = 0
+    prefetched_entry: Optional[DFlashPrefetchEntry] = None
 
     while start < max_length:
+        generated_before_round = start - num_input_tokens
         block_len = min(block_size, max_length - start)
         if block_len <= 0:
             break
 
         t_step0 = _cuda_time()
-        block_output_ids = output_ids[:, start : start + block_len].clone()
-        block_position_ids = position_ids[:, start : start + block_len]
-
-        if block_len > 1:
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
-                model(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, draft_cache.get_seq_length() : start + block_len],
-                    past_key_values=draft_cache,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, 1 - block_len :, :]
+        if prefetched_entry is None or prefetched_entry.block_output_ids.shape[1] != block_len:
+            current_entry = _generate_dflash_prefetch_entry(
+                model,
+                target,
+                target_hidden,
+                first_token=int(output_ids[0, start].item()),
+                block_len=block_len,
+                mask_token_id=mask_token_id,
+                start_position=start,
+                temperature=temperature,
             )
-            draft_cache.crop(start)
-            block_output_ids[:, 1:block_len] = sample(draft_logits[:, : block_len - 1, :], temperature)
+        else:
+            current_entry = prefetched_entry
+
+        block_output_ids = current_entry.block_output_ids.clone()
+        block_position_ids = position_ids[:, start : start + block_len]
 
         output = target(
             block_output_ids,
@@ -255,6 +388,24 @@ def ssd_dflash_generate_monitored(
             prev_hidden_last = curr_hidden_last
             if hidden_drift is not None:
                 hidden_drifts.append(hidden_drift)
+
+        actual_bonus = None
+        if start + accepted_tokens < output_ids.shape[1]:
+            actual_bonus = int(posterior[0, acceptance_len].item())
+
+        next_round_cache = _build_dflash_outcome_cache(
+            model,
+            target,
+            current_entry,
+            generated_before_round=generated_before_round,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            mask_token_id=mask_token_id,
+            start_position=start,
+            temperature=temperature,
+            speculation_fanout=speculation_fanout,
+        )
+        prefetched_entry = None if actual_bonus is None else next_round_cache.get((accepted_tokens, actual_bonus))
 
         step_ms = (_cuda_time() - t_step0) * 1000.0
         decode_tokens = max(1, start - num_input_tokens)
@@ -424,7 +575,7 @@ def _run_dataset(args: argparse.Namespace) -> None:
     torch.cuda.set_device(_dist_local_rank())
     device = torch.device(f"cuda:{_dist_local_rank()}")
 
-    attn_impl = _check_flash_attn_required()
+    attn_impl = _resolve_attn_impl()
 
     logger.info(f"Loading target model: {args.model}")
     target = AutoModelForCausalLM.from_pretrained(
@@ -479,6 +630,7 @@ def _run_dataset(args: argparse.Namespace) -> None:
                 request_id=req_id,
                 monitor_every=args.monitor_every,
                 live_monitor=args.live_monitor,
+                speculation_fanout=args.speculation_fanout,
                 trace_fh=trace_fh,
             )
 
@@ -514,7 +666,9 @@ def _run_dataset(args: argparse.Namespace) -> None:
         "temperature": args.temperature,
         "world_size": _dist_size(),
         "block_size": block_size,
-        "flash_attention": True,
+        "speculation_fanout": args.speculation_fanout,
+        "attention_implementation": attn_impl,
+        "flash_attention": attn_impl == "flash_attention_2",
     }
 
     with open(out_dir / "aggregate.json", "w") as fh:
@@ -533,7 +687,7 @@ def _run_dataset(args: argparse.Namespace) -> None:
 def _run_single_prompt(args: argparse.Namespace) -> None:
     device = torch.device(f"cuda:{args.gpu}")
     torch.cuda.set_device(device)
-    attn_impl = _check_flash_attn_required()
+    attn_impl = _resolve_attn_impl()
 
     target = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -563,6 +717,7 @@ def _run_single_prompt(args: argparse.Namespace) -> None:
         request_id="interactive",
         monitor_every=max(1, args.monitor_every),
         live_monitor=True,
+        speculation_fanout=args.speculation_fanout,
         trace_fh=None,
     )
 
@@ -578,8 +733,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Novel SSD+DFlash CUDA runtime with live monitoring, eval, and logging."
     )
-    p.add_argument("--model", default="Qwen/Qwen3-8B")
-    p.add_argument("--draft-model", default="z-lab/Qwen3-8B-DFlash-b16")
+    p.add_argument("--model", default="Qwen/Qwen3-4B")
+    p.add_argument("--draft-model", default="z-lab/Qwen3-4B-DFlash-b16")
     p.add_argument("--dataset", default="gsm8k", choices=list(DATASETS))
     p.add_argument("--max-samples", type=int, default=64)
     p.add_argument("--max-new-tokens", type=int, default=1024)
@@ -589,6 +744,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--enable-thinking", action="store_true")
     p.add_argument("--live-monitor", action="store_true")
     p.add_argument("--monitor-every", type=int, default=8)
+    p.add_argument("--speculation-fanout", type=int, default=2)
     p.add_argument("--write-text-outputs", action="store_true")
     p.add_argument("--out-dir", default="results/ssd_dflash_accel")
 

@@ -1,0 +1,32 @@
+{
+  "metadata": {
+    "timestamp": "20260430_075455",
+    "model": "Qwen/Qwen3-4B",
+    "draft_model": "z-lab/Qwen3-4B-DFlash-b16",
+    "dataset": "gsm8k",
+    "max_new_tokens": 1024,
+    "temperature": 0.0,
+    "world_size": 2,
+    "block_size": 16,
+    "attention_implementation": "sdpa",
+    "flash_attention": false
+  },
+  "aggregate": {
+    "num_requests": 64,
+    "mean_ttft": 0.03689711515471572,
+    "median_ttft": 0.02320588834118098,
+    "mean_time_per_output_token": 0.005154353238375155,
+    "mean_decode_tps": 201.6636863514042,
+    "median_decode_tps": 196.8482681392059,
+    "mean_acceptance_tokens": 6.243879433488812,
+    "median_acceptance_tokens": 6.055,
+    "p10_acceptance_tokens": 1.4343750000000002,
+    "block_size": 16,
+    "acceptance_utilization": 0.39024246459305073,
+    "mean_hidden_drift_cosine": 0.6617471920985687,
+    "stop_reasons": {
+      "eos": 63,
+      "max_new_tokens": 1
+    }
+  }
+}

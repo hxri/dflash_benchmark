@@ -23,6 +23,7 @@ SSD_DRAFT="${SSD_DRAFT:-Qwen/Qwen3-0.6B}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 NUM_DRAFT_TOKENS="${NUM_DRAFT_TOKENS:-5}"
+SPECULATION_FANOUT="${SPECULATION_FANOUT:-2}"
 GPU="${GPU:-0}"
 PYTHON=".venv-cuda/bin/python"
 
@@ -42,6 +43,7 @@ echo "=================================================="
 echo "Target model:     $TARGET_MODEL"
 echo "SSD draft model:  $SSD_DRAFT"
 echo "Num draft tokens: $NUM_DRAFT_TOKENS"
+echo "Spec fan-out:     $SPECULATION_FANOUT"
 echo "Max new tokens:   $MAX_NEW_TOKENS"
 echo "Temperature:      $TEMPERATURE"
 echo "Datasets:         $DATASETS"
@@ -57,6 +59,7 @@ for DATASET in $DATASETS; do
         --model "$TARGET_MODEL" \
         --ssd-draft-model "$SSD_DRAFT" \
         --num-draft-tokens "$NUM_DRAFT_TOKENS" \
+        --speculation-fanout "$SPECULATION_FANOUT" \
         --dataset "$DATASET" \
         --max-new-tokens "$MAX_NEW_TOKENS" \
         --temperature "$TEMPERATURE" \

@@ -1,0 +1,35 @@
+==================================================================
+  True Saguaro Two-GPU Async Speculative Decoding
+==================================================================
+  Path             : ssd
+  Target (cuda:0)  : Qwen/Qwen3-4B
+  Draft  (cuda:1)  : Qwen/Qwen3-0.6B  (SSD AR, 5 tokens/round)
+  Dataset          : gsm8k  (max_samples=64)
+  Max new tokens   : 1024  temperature=0.0
+  Speculation fanout: 1 branches/acceptance-len
+  Output dir        : results/saguaro/ssd_20260430_083609
+==================================================================
+2026-04-30 08:36:12.519 | WARNING  | __main__:_resolve_attn_impl:741 - flash-attn not installed — using torch.sdpa. Install for best performance: pip install flash-attn --no-build-isolation
+2026-04-30 08:36:12.519 | INFO     | __main__:_run_dataset:758 - Loading target model on cuda:0: Qwen/Qwen3-4B
+Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 157.75it/s]
+2026-04-30 08:36:17.817 | INFO     | __main__:_run_dataset:785 - Loading SSD draft on cuda:1: Qwen/Qwen3-0.6B
+Saguaro (ssd) eval: 100%|██████████████████████████████████████████████████████████████████████████████| 64/64 [42:18<00:00, 39.67s/it]
+        SSD+DFlash Aggregate         
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Metric                 ┃    Value ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ # requests             │       64 │
+│ Mean decode tok/s      │     7.59 │
+│ Median decode tok/s    │     7.60 │
+│ Mean TTFT (s)          │   0.0306 │
+│ Mean accept tokens     │ 4.62 / 5 │
+│ Acceptance utilization │    92.5% │
+│ Mean hidden drift cos  │      n/a │
+└────────────────────────┴──────────┘
+  Cache hit rate : 80.3%  (ssd path)
+
+Saved -> results/saguaro/ssd_20260430_083609/aggregate.json
+Traces -> results/saguaro/ssd_20260430_083609/trace.jsonl
+Samples -> results/saguaro/ssd_20260430_083609/samples.jsonl
+
+Results saved to: results/saguaro/ssd_20260430_083609

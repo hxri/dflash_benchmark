@@ -1,0 +1,15 @@
+==================================================
+SSD-only Benchmark (transformers / CUDA)
+==================================================
+Target model:     Qwen/Qwen3-4B
+SSD draft model:  Qwen/Qwen3-0.6B
+Num draft tokens: 5
+Spec fan-out:     2
+Max new tokens:   1024
+Temperature:      0.0
+Datasets:         gsm8k
+GPU:              0
+==================================================
+
+
+---------- Dataset: gsm8k ----------
