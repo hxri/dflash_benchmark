@@ -1,0 +1,92 @@
+---------- Dataset: gsm8k ---------- 
+| 1319/1319 [2:36:20<100%|███████████████████████████████████████████████████████████████████████████████████████████
+██████████████████| 1319/1319 [2:36:20<00:00,  7.11s/it]
+Baseline throughput: 52.48 tok/s      
+DFlash throughput:  231.83 tok/s      
+Decoding speedup: 4.42                
+Average Acceptance length: 6.47       
+Acceptance length histogram: ['0.0%', '12.1%', '13.8%', '12.1%', '9.8%', '8.2%', '6.7%', '5.1%', '4.5%', '3.9%', '3.4%', '3.0%',                        
+'2.5%', '2.3%', '2.0%', '1.8%', '8.8%']                                     
+
+---------- Dataset: math500 ----------                                      
+/home/dflash_benchmark/dflash/benchmark.py:141: UserWarning: RANK not set. Skipping distributed initialization.                                         
+  warnings.warn("RANK not set. Skipping distributed initialization.")                                                                                   
+2026-04-29 16:59:27.943 | WARNING  | __main__:_get_transformers_attn_impl:190 - flash_attn not installed. Falling back to torch.sdpa. Speedup will be lo
+wer. For optimal speedup in Transformers backend, please install: pip install flash-attn --no-build-isolation                                           
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 51.49it/s]                 
+ math500 ...                          
+README.md: 100%|██████████████████████████████████████████████████████████████████████████████████████| 412/412 [00:00<00:00, 2.56MB/s]                 
+test.jsonl: 447kB [00:00, 73.3MB/s]                                         
+Generating test split: 100%|███████████████████████████████████████████████████████████████| 500/500 [00:00<00:00, 45638.88 examples/s]                 
+ /home/dflash_benchmark/cache/math500.jsonl  (500 samples)                  
+100%|██████████████████████████████████████████████████████████████████████████████████████████████| 500/500 [2:32:53<00:00, 18.35s/it]                 
+Baseline throughput: 50.67 tok/s
+DFlash throughput:  274.97 tok/s
+Decoding speedup: 5.43
+Average Acceptance length: 8.06
+Acceptance length histogram: ['0.0%', '9.3%', '11.2%', '10.0%', '8.1%', '6.7%', '5.1%', '4.7%', '4.1%', '3.7%', '3.7%', '3.0%', '2.9%', '2.6%', '2.5%', 
+'2.5%', '19.7%']
+
+---------- Dataset: humaneval ----------
+/home/dflash_benchmark/dflash/benchmark.py:141: UserWarning: RANK not set. Skipping distributed initialization.
+  warnings.warn("RANK not set. Skipping distributed initialization.")
+2026-04-29 19:32:30.982 | WARNING  | __main__:_get_transformers_attn_impl:190 - flash_attn not installed. Falling back to torch.sdpa. Speedup will be lower. For optimal speedup in Transformers backend, please install: pip install flash-attn --no-build-isolation
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 166.43it/s]
+ humaneval ...
+README.md: 6.52kB [00:00, 25.1MB/s]
+openai_humaneval/test-00000-of-00001.par(…): 100%|██████████████████████████████████████████████████████████████████| 83.9k/83.9k [00:00<00:00, 196kB/s]
+Generating test split: 100%|████████████████████████████████████████████████████████████████████████████████| 164/164 [00:00<00:00, 19161.14 examples/s]
+ /home/dflash_benchmark/cache/humaneval.jsonl  (164 samples)
+100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 164/164 [28:04<00:00, 10.27s/it]
+Baseline throughput: 52.02 tok/s
+DFlash throughput:  237.74 tok/s
+Decoding speedup: 4.57
+Average Acceptance length: 6.67
+Acceptance length histogram: ['0.0%', '12.3%', '14.0%', '11.7%', '10.4%', '7.5%', '5.9%', '4.8%', '3.9%', '3.2%', '2.6%', '2.6%', '2.3%', '2.2%', 
+'1.8%', '1.7%', '13.3%']
+
+---------- Dataset: mbpp ----------
+/home/dflash_benchmark/dflash/benchmark.py:141: UserWarning: RANK not set. Skipping distributed initialization.
+  warnings.warn("RANK not set. Skipping distributed initialization.")
+2026-04-29 20:00:43.426 | WARNING  | __main__:_get_transformers_attn_impl:190 - flash_attn not installed. Falling back to torch.sdpa. Speedup will be lower. For optimal speedup in Transformers backend, please install: pip install flash-attn --no-build-isolation
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 177.97it/s]
+ mbpp ...
+README.md: 9.06kB [00:00, 16.5MB/s]
+sanitized/train-00000-of-00001.parquet: 100%|██████████████████████████████████████████████████████████████████████| 33.9k/33.9k [00:00<00:00, 80.5kB/s]
+sanitized/test-00000-of-00001.parquet: 100%|████████████████████████████████████████████████████████████████████████| 60.9k/60.9k [00:00<00:00, 278kB/s]
+sanitized/validation-00000-of-00001.parq(…): 100%|█████████████████████████████████████████████████████████████████| 14.0k/14.0k [00:00<00:00, 65.2kB/s]
+sanitized/prompt-00000-of-00001.parquet: 100%|█████████████████████████████████████████████████████████████████████| 6.72k/6.72k [00:00<00:00, 31.8kB/s]
+Generating train split: 100%|███████████████████████████████████████████████████████████████████████████████| 120/120 [00:00<00:00, 12247.63 examples/s]
+Generating test split: 100%|████████████████████████████████████████████████████████████████████████████████| 257/257 [00:00<00:00, 51135.49 examples/s]
+Generating validation split: 100%|████████████████████████████████████████████████████████████████████████████| 43/43 [00:00<00:00, 10705.47 examples/s]
+Generating prompt split: 100%|███████████████████████████████████████████████████████████████████████████████████| 7/7 [00:00<00:00, 1968.63 examples/s]
+ /home/dflash_benchmark/cache/mbpp.jsonl  (257 samples)
+100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 257/257 [33:57<00:00,  7.93s/it]
+Baseline throughput: 52.90 tok/s
+DFlash throughput:  216.39 tok/s
+Decoding speedup: 4.09
+Average Acceptance length: 6.08
+Acceptance length histogram: ['0.0%', '13.6%', '15.3%', '12.6%', '10.2%', '8.4%', '6.0%', '5.1%', '4.3%', '3.8%', '3.0%', '2.5%', '2.0%', '2.1%', 
+'1.7%', '1.4%', '7.9%']
+
+---------- Dataset: mt-bench ----------
+/home/dflash_benchmark/dflash/benchmark.py:141: UserWarning: RANK not set. Skipping distributed initialization.
+  warnings.warn("RANK not set. Skipping distributed initialization.")
+2026-04-29 20:34:50.454 | WARNING  | __main__:_get_transformers_attn_impl:190 - flash_attn not installed. Falling back to torch.sdpa. Speedup will be lower. For optimal speedup in Transformers backend, please install: pip install flash-attn --no-build-isolation
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:00<00:00, 181.16it/s]
+ mt-bench ...
+README.md: 1.49kB [00:00, 3.86MB/s]
+data/train-00000-of-00001-67c6c9fef07685(…): 100%|█████████████████████████████████████████████████████████████████| 30.1k/30.1k [00:00<00:00, 70.8kB/s]
+Generating train split: 100%|█████████████████████████████████████████████████████████████████████████████████| 80/80 [00:00<00:00, 10844.65 examples/s]
+ /home/dflash_benchmark/cache/mt-bench.jsonl  (80 samples)
+100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 80/80 [35:13<00:00, 26.42s/it]
+Baseline throughput: 53.61 tok/s
+DFlash throughput:  132.73 tok/s
+Decoding speedup: 2.48
+Average Acceptance length: 4.41
+Acceptance length histogram: ['0.0%', '28.5%', '24.4%', '15.9%', '9.5%', '6.0%', '3.7%', '2.6%', '1.9%', '1.4%', '1.1%', '0.7%', '0.6%', '0.6%', '0.4%',
+'0.4%', '2.2%']
+
+==================================================
+Benchmark complete.
+==================================================
