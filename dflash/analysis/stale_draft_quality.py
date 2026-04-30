@@ -91,11 +91,19 @@ def _run_stale_comparison(target, draft, input_ids, max_new_tokens, temperature)
         block = output_ids[:, start: start + bs].clone()
         noise = target.model.embed_tokens(block)
 
+        # Position IDs must span ctx_len + bs tokens (not just bs).
+        # Use ctx_start = start - H.shape[1] so the formula works even when
+        # H_stale is intentionally misaligned (one step behind H_fresh).
+        ctx_fresh = H_fresh.shape[1]
+        ctx_stale = H_stale.shape[1]
+        pos_fresh = position_ids[:, start - ctx_fresh : start - ctx_fresh + ctx_fresh + bs]
+        pos_stale = position_ids[:, start - ctx_stale : start - ctx_stale + ctx_stale + bs]
+
         # Fresh draft
         fresh_logits = target.lm_head(draft(
             target_hidden=H_fresh,
             noise_embedding=noise,
-            position_ids=position_ids[:, draft_cache_fresh.get_seq_length(): start + bs],
+            position_ids=pos_fresh,
             past_key_values=draft_cache_fresh,
             use_cache=True,
             is_causal=False,
@@ -103,11 +111,12 @@ def _run_stale_comparison(target, draft, input_ids, max_new_tokens, temperature)
         draft_cache_fresh.crop(start)
         fresh_tokens = sample(fresh_logits)  # [1, bs-1]
 
-        # Stale draft (same noise, stale H)
+        # Stale draft — same noise, but H from the previous step.
+        # pos_stale accounts for H_stale potentially having a different length.
         stale_logits = target.lm_head(draft(
             target_hidden=H_stale,
             noise_embedding=noise,
-            position_ids=position_ids[:, draft_cache_stale.get_seq_length(): start + bs],
+            position_ids=pos_stale,
             past_key_values=draft_cache_stale,
             use_cache=True,
             is_causal=False,
