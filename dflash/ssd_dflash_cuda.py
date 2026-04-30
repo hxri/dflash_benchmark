@@ -262,78 +262,78 @@ def dflash_ssd_generate(
         pre_result: dict = {}
 
         def _run_verify():
-            torch.cuda.set_device(target_device)
-            ev_s = torch.cuda.Event(enable_timing=True)
-            ev_e = torch.cuda.Event(enable_timing=True)
-            ev_s.record()
-            v_out = target(
-                verify_block,
-                position_ids=block_positions,
-                past_key_values=target_cache,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            ev_e.record()
-            torch.cuda.synchronize(target_device)
-            verify_result["out"] = v_out
-            verify_result["t_ms"] = ev_s.elapsed_time(ev_e)
+            # torch.inference_mode() is thread-local — child threads do NOT inherit
+            # it from the spawning thread, so we must declare it explicitly here.
+            with torch.inference_mode():
+                try:
+                    torch.cuda.set_device(target_device)
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    ev_s.record()
+                    v_out = target(
+                        verify_block,
+                        position_ids=block_positions,
+                        past_key_values=target_cache,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    ev_e.record()
+                    torch.cuda.synchronize(target_device)
+                    verify_result["out"] = v_out
+                    verify_result["t_ms"] = ev_s.elapsed_time(ev_e)
+                except Exception as exc:
+                    verify_result["exc"] = exc
 
         def _run_pre_draft():
-            torch.cuda.set_device(draft_device)
-            # Bug-1 fix: each fan-out hypothesis k_f needs its own position IDs.
-            #
-            # H_prev was produced at the end of the PREVIOUS verify step.  It has
-            # shape [1, H_prev_len, …] where H_prev_len = prev_acceptance + 1.
-            # The corresponding absolute ctx_start = start - H_prev_len (the
-            # position of the first token in H_prev).
-            #
-            # For hypothesis k_f (acceptance_length = k_f):
-            #   ctx_len_kf  = min(k_f + 1, H_prev_len)   (can't exceed available H)
-            #   pos range   = [ctx_start : ctx_start + ctx_len_kf + bs]
-            #   length      = ctx_len_kf + bs  ← must equal len(cat(k_ctx, k_noise))
-            #
-            # This matches dflash_generate's convention where
-            #   position_ids[:, past_kv_len : start + block_size]
-            # has length ctx_len + block_size.
-            H_prev_len = H_prev_d1.shape[1]
-            ctx_start = start - H_prev_len   # absolute position of H_prev's first token
+            # Same reason as above — declare inference_mode inside the thread.
+            with torch.inference_mode():
+                try:
+                    torch.cuda.set_device(draft_device)
+                    H_prev_len = H_prev_d1.shape[1]
+                    ctx_start = start - H_prev_len
 
-            ev_s = torch.cuda.Event(enable_timing=True)
-            ev_e = torch.cuda.Event(enable_timing=True)
-            blocks: dict[int, torch.Tensor] = {}
-            ev_s.record()
+                    ev_s = torch.cuda.Event(enable_timing=True)
+                    ev_e = torch.cuda.Event(enable_timing=True)
+                    blocks: dict[int, torch.Tensor] = {}
+                    ev_s.record()
 
-            for k_f in top_f:
-                ctx_len_kf = min(k_f + 1, H_prev_len)
-                h_ctx = H_prev_d1[:, :ctx_len_kf, :]
+                    for k_f in top_f:
+                        ctx_len_kf = min(k_f + 1, H_prev_len)
+                        h_ctx = H_prev_d1[:, :ctx_len_kf, :]
 
-                # Position IDs: ctx positions then noise positions.
-                kf_pos = position_ids[
-                    :, ctx_start : ctx_start + ctx_len_kf + bs
-                ].to(draft_device, non_blocking=True)
+                        kf_pos = position_ids[
+                            :, ctx_start : ctx_start + ctx_len_kf + bs
+                        ].to(draft_device, non_blocking=True)
 
-                first_d1 = output_ids[:, start: start + 1].to(draft_device, non_blocking=True)
-                blk = torch.cat([
-                    first_d1,
-                    torch.full((1, bs - 1), mask_token_id, dtype=torch.long, device=draft_device),
-                ], dim=1)
-                noise = draft_embed(blk)
+                        first_d1 = output_ids[:, start: start + 1].to(
+                            draft_device, non_blocking=True
+                        )
+                        blk = torch.cat([
+                            first_d1,
+                            torch.full(
+                                (1, bs - 1), mask_token_id,
+                                dtype=torch.long, device=draft_device,
+                            ),
+                        ], dim=1)
+                        noise = draft_embed(blk)
 
-                tmp_cache = DynamicCache()
-                logits_d = draft_lm_head(draft_model(
-                    target_hidden=h_ctx,
-                    noise_embedding=noise,
-                    position_ids=kf_pos,
-                    past_key_values=tmp_cache,
-                    use_cache=True,
-                    is_causal=False,
-                )[:, 1 - bs:, :])
-                blocks[k_f] = sample(logits_d)  # [1, bs-1]
+                        tmp_cache = DynamicCache()
+                        logits_d = draft_lm_head(draft_model(
+                            target_hidden=h_ctx,
+                            noise_embedding=noise,
+                            position_ids=kf_pos,
+                            past_key_values=tmp_cache,
+                            use_cache=True,
+                            is_causal=False,
+                        )[:, 1 - bs:, :])
+                        blocks[k_f] = sample(logits_d)
 
-            ev_e.record()
-            torch.cuda.synchronize(draft_device)
-            pre_result["blocks"] = blocks
-            pre_result["t_ms"] = ev_s.elapsed_time(ev_e)
+                    ev_e.record()
+                    torch.cuda.synchronize(draft_device)
+                    pre_result["blocks"] = blocks
+                    pre_result["t_ms"] = ev_s.elapsed_time(ev_e)
+                except Exception as exc:
+                    pre_result["exc"] = exc
 
         t_wall_start = time.perf_counter()
         t_a = threading.Thread(target=_run_verify, daemon=True)
@@ -343,6 +343,12 @@ def dflash_ssd_generate(
         t_a.join()
         t_b.join()
         t_wall_ms = (time.perf_counter() - t_wall_start) * 1000
+
+        # Re-raise any exception that occurred inside either thread.
+        if "exc" in verify_result:
+            raise verify_result["exc"]
+        if "exc" in pre_result:
+            raise pre_result["exc"]
 
         # ── Process verify result ─────────────────────────
         v_out = verify_result["out"]
