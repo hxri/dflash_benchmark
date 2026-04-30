@@ -52,6 +52,20 @@ DATASETS = {
         "format": lambda x: x["prompt"],
         "multi_turn": True,
     },
+    # Datasets used in the SSD (Speculative Speculative Decoding) paper
+    # (Kumar, Dao & May, arXiv:2603.03251 / ICLR 2026)
+    "alpaca": {
+        "load_args": ("tatsu-lab/alpaca",),
+        "load_kwargs": {"split": "train"},
+        "format": lambda x: (
+            x["instruction"] + ("\n" + x["input"] if x.get("input") else "")
+        ),
+    },
+    "ultrafeedback": {
+        "load_args": ("openbmb/UltraFeedback",),
+        "load_kwargs": {"split": "train"},
+        "format": lambda x: x["instruction"],
+    },
 }
 
 
@@ -117,19 +131,32 @@ def _make_decode_metrics(num_output_tokens: int, generation_tps: float, acceptan
     )
 
 
-def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
+def _print_decode_summary(responses: list[dict], block_size: int) -> None:
     baseline_tpot = np.mean([r[1].time_per_output_token for r in responses])
     dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
-    print(f"Baseline throughput: {1 / baseline_tpot:.2f} tok/s")
-    print(f"DFlash throughput:  {1 / dflash_tpot:.2f} tok/s")
-    print(f"Decoding speedup: {baseline_tpot / dflash_tpot:.2f}")
+
+    print(f"Autoregressive (baseline): {1 / baseline_tpot:.2f} tok/s")
+
+    has_sd = "sd" in responses[0]
+    if has_sd:
+        sd_tpot = np.mean([r["sd"].time_per_output_token for r in responses])
+        sd_speedup = baseline_tpot / sd_tpot
+        print(f"Spec-SD (SSD baseline):    {1 / sd_tpot:.2f} tok/s  (speedup vs AR: {sd_speedup:.2f}x)")
+        sd_accs = [a for r in responses for a in r["sd"].acceptance_lengths]
+        if sd_accs:
+            print(f"  Avg acceptance length:   {np.mean(sd_accs):.2f}")
+
+    dflash_speedup_ar = baseline_tpot / dflash_tpot
+    print(f"DFlash:                    {1 / dflash_tpot:.2f} tok/s  (speedup vs AR: {dflash_speedup_ar:.2f}x)")
+    if has_sd:
+        print(f"  DFlash vs Spec-SD:       {sd_tpot / dflash_tpot:.2f}x")
 
     mean_accept = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
-    print(f"Average Acceptance length: {mean_accept:.2f}")
+    print(f"  Avg acceptance length:   {mean_accept:.2f}")
 
     acceptance_lengths = list(chain.from_iterable(r[block_size].acceptance_lengths for r in responses))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
-    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    print(f"  Acceptance histogram:    {[f'{x * 100:.1f}%' for x in histogram]}")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -200,7 +227,7 @@ def _run_transformers(args: argparse.Namespace) -> None:
     from torch import distributed as torch_dist
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from .model import DFlashDraftModel, dflash_generate
+    from .model import DFlashDraftModel, dflash_generate, sd_generate
 
     _check_transformers_model(args.model)
 
@@ -224,7 +251,15 @@ def _run_transformers(args: argparse.Namespace) -> None:
         args.draft_model, attn_implementation=attn_impl, dtype=torch.bfloat16,
     ).to(device).eval()
 
+    ssd_draft = None
+    if args.ssd_draft_model:
+        logger.info(f"Loading SSD draft (standard LM): {args.ssd_draft_model}")
+        ssd_draft = AutoModelForCausalLM.from_pretrained(
+            args.ssd_draft_model, attn_implementation=attn_impl, dtype=torch.bfloat16,
+        ).to(device).eval()
+
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
+    num_draft_tokens = args.num_draft_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     dataset = load_and_process_dataset(args.dataset)
 
@@ -250,6 +285,18 @@ def _run_transformers(args: argparse.Namespace) -> None:
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
                     block_size=bs,
+                    return_stats=True,
+                )
+
+            if ssd_draft is not None:
+                response["sd"] = sd_generate(
+                    ssd_draft,
+                    target=target,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    stop_token_ids=[tokenizer.eos_token_id],
+                    temperature=args.temperature,
+                    num_draft_tokens=num_draft_tokens,
                     return_stats=True,
                 )
 
@@ -340,12 +387,20 @@ def _run_mlx(args: argparse.Namespace) -> None:
     draft = load_draft(args.draft_model, sliding_window_size=args.draft_sliding_window_size)
     block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
 
+    ssd_draft_model = None
+    if args.ssd_draft_model:
+        logger.info(f"Loading SSD draft (standard LM): {args.ssd_draft_model}")
+        ssd_draft_model, _ = load(args.ssd_draft_model)
+
     dataset = load_and_process_dataset(args.dataset)
     dataset = _limit_dataset(dataset, args.max_samples)
 
     warmup_prompt = tokenizer.encode("Hi")
     list(stream_generate_baseline(model, tokenizer, warmup_prompt, 3, sampler=sampler))
     list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
+    if ssd_draft_model is not None:
+        list(stream_generate_baseline(model, tokenizer, warmup_prompt, 3,
+                                       draft_model=ssd_draft_model, sampler=sampler))
 
     responses = []
     for idx in tqdm(range(len(dataset))):
@@ -362,6 +417,17 @@ def _run_mlx(args: argparse.Namespace) -> None:
                 tokens_bl.append(r.token)
                 tps_bl = r.generation_tps
             response[1] = _make_decode_metrics(len(tokens_bl), tps_bl, [1])
+
+            if ssd_draft_model is not None:
+                tokens_sd, tps_sd, accs_sd = [], 0, []
+                for r in stream_generate_baseline(
+                    model, tokenizer, prompt, args.max_new_tokens,
+                    draft_model=ssd_draft_model, sampler=sampler,
+                ):
+                    tokens_sd.append(r.token)
+                    tps_sd = r.generation_tps
+                # mlx_lm's built-in SD doesn't expose per-step acceptance counts
+                response["sd"] = _make_decode_metrics(len(tokens_sd), tps_sd, [])
 
             tokens_df, accs, tps_df = [], [], 0
             for r in stream_generate(model, draft, tokenizer, prompt, block_size, args.max_new_tokens, sampler=sampler):
@@ -489,6 +555,13 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--draft-sliding-window-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+
+    # SSD (Speculative Speculative Decoding) baseline: standard autoregressive LM as draft
+    # Paper: Kumar, Dao & May, arXiv:2603.03251 (ICLR 2026)
+    parser.add_argument("--ssd-draft-model", type=str, default=None,
+                        help="Standard LM draft for Spec-SD baseline comparison (e.g. Qwen/Qwen3-0.6B)")
+    parser.add_argument("--num-draft-tokens", type=int, default=5,
+                        help="Draft tokens per verify step for Spec-SD baseline (default: 5)")
 
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:30000")
     parser.add_argument("--num-prompts", type=int, default=1024)

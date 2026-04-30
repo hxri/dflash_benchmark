@@ -364,3 +364,124 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             stop_token_ids=stop_token_ids,
             temperature=temperature,
         )
+
+
+@torch.inference_mode()
+def sd_generate(
+    draft: nn.Module,
+    target: nn.Module,
+    input_ids: torch.LongTensor,
+    max_new_tokens: int,
+    stop_token_ids: Optional[list[int]],
+    temperature: float,
+    num_draft_tokens: int = 5,
+    return_stats: bool = False,
+):
+    """Standard speculative decoding with an autoregressive LM as draft.
+
+    Implements the batch-verification algorithm: draft model generates
+    num_draft_tokens autoregressively, target verifies all in one forward
+    pass, longest matching prefix is accepted plus one bonus token.
+    """
+    num_input = input_ids.shape[1]
+    device = input_ids.device
+
+    target_cache = DynamicCache()
+    draft_cache = DynamicCache()
+
+    prefill_start = _cuda_time() if return_stats else None
+
+    t_out = target(input_ids, past_key_values=target_cache, use_cache=True, logits_to_keep=1)
+    draft(input_ids, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
+    first_tok = int(sample(t_out.logits[:, -1:], temperature)[0, 0])
+
+    time_to_first_token = (_cuda_time() - prefill_start) if return_stats else None
+    decode_start = _cuda_time() if return_stats else None
+
+    output = [first_tok]
+    acceptance_lengths = [1]
+    # target_cache_pos: tokens in target KV cache (= num_input after prefill)
+    # draft_cache_pos: tokens in draft KV cache (= num_input after prefill)
+    target_cache_pos = num_input
+    draft_cache_pos = num_input
+
+    while len(output) < max_new_tokens:
+        curr_tok = output[-1]
+        curr_tensor = torch.tensor([[curr_tok]], dtype=torch.long, device=device)
+        n = min(num_draft_tokens, max_new_tokens - len(output))
+        old_draft_pos = draft_cache_pos
+        old_target_pos = target_cache_pos
+
+        # --- Draft phase: feed curr_tok then generate n draft tokens ---
+        # After the loop we will have fed: curr_tok + draft_ids[0:n-2] = n tokens
+        d_out = draft(curr_tensor, past_key_values=draft_cache, use_cache=True, logits_to_keep=1)
+        draft_cache_pos += 1
+        draft_ids = []
+        for i in range(n):
+            tok = int(sample(d_out.logits[:, -1:], temperature)[0, 0])
+            draft_ids.append(tok)
+            if i < n - 1:
+                d_out = draft(
+                    torch.tensor([[tok]], dtype=torch.long, device=device),
+                    past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
+                )
+                draft_cache_pos += 1
+
+        # --- Verify phase: feed curr_tok + all n draft tokens = n+1 tokens ---
+        verify_input = torch.cat(
+            [curr_tensor, torch.tensor([draft_ids], dtype=torch.long, device=device)], dim=1
+        )
+        t_out = target(verify_input, past_key_values=target_cache, use_cache=True)
+        target_cache_pos += n + 1
+        t_preds = sample(t_out.logits, temperature)[0].tolist()
+
+        # Find acceptance length
+        accepted = 0
+        for i in range(n):
+            if draft_ids[i] == t_preds[i]:
+                accepted += 1
+            else:
+                break
+
+        bonus = t_preds[accepted]
+        new_toks = (draft_ids[:accepted] + [bonus])[: max_new_tokens - len(output)]
+        output.extend(new_toks)
+        acceptance_lengths.append(len(new_toks))
+
+        # --- KV cache rollback ---
+        # Target: keep old + accepted + 1 (curr_tok + accepted drafts)
+        target_cache.crop(old_target_pos + accepted + 1)
+        target_cache_pos = old_target_pos + accepted + 1
+
+        # Draft: loop fed curr_tok + draft_ids[0:n-2] (n tokens total = old+n)
+        # accepted < n-1: over-fed, crop; accepted==n: under-fed d[n-1], feed it
+        if accepted < n - 1:
+            draft_cache.crop(old_draft_pos + accepted + 1)
+        elif accepted == n:
+            draft(
+                torch.tensor([[draft_ids[-1]]], dtype=torch.long, device=device),
+                past_key_values=draft_cache, use_cache=True, logits_to_keep=1,
+            )
+        draft_cache_pos = old_draft_pos + accepted + 1
+
+        if stop_token_ids and any(t in output for t in stop_token_ids):
+            break
+
+    output_ids = torch.cat(
+        [input_ids, torch.tensor([output[:max_new_tokens]], dtype=torch.long, device=device)],
+        dim=1,
+    )
+
+    if not return_stats:
+        return output_ids
+
+    decode_time = _cuda_time() - decode_start
+    num_out = len(output)
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input,
+        num_output_tokens=num_out,
+        time_to_first_token=time_to_first_token,
+        time_per_output_token=decode_time / max(num_out, 1),
+        acceptance_lengths=acceptance_lengths,
+    )
