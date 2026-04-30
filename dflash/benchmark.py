@@ -131,10 +131,8 @@ def _make_decode_metrics(num_output_tokens: int, generation_tps: float, acceptan
     )
 
 
-def _print_decode_summary(responses: list[dict], block_size: int) -> None:
+def _print_decode_summary(responses: list[dict], block_size: int | None) -> None:
     baseline_tpot = np.mean([r[1].time_per_output_token for r in responses])
-    dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
-
     print(f"Autoregressive (baseline): {1 / baseline_tpot:.2f} tok/s")
 
     has_sd = "sd" in responses[0]
@@ -146,17 +144,17 @@ def _print_decode_summary(responses: list[dict], block_size: int) -> None:
         if sd_accs:
             print(f"  Avg acceptance length:   {np.mean(sd_accs):.2f}")
 
-    dflash_speedup_ar = baseline_tpot / dflash_tpot
-    print(f"DFlash:                    {1 / dflash_tpot:.2f} tok/s  (speedup vs AR: {dflash_speedup_ar:.2f}x)")
-    if has_sd:
-        print(f"  DFlash vs Spec-SD:       {sd_tpot / dflash_tpot:.2f}x")
-
-    mean_accept = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
-    print(f"  Avg acceptance length:   {mean_accept:.2f}")
-
-    acceptance_lengths = list(chain.from_iterable(r[block_size].acceptance_lengths for r in responses))
-    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
-    print(f"  Acceptance histogram:    {[f'{x * 100:.1f}%' for x in histogram]}")
+    if block_size is not None:
+        dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
+        dflash_speedup_ar = baseline_tpot / dflash_tpot
+        print(f"DFlash:                    {1 / dflash_tpot:.2f} tok/s  (speedup vs AR: {dflash_speedup_ar:.2f}x)")
+        if has_sd:
+            print(f"  DFlash vs Spec-SD:       {sd_tpot / dflash_tpot:.2f}x")
+        mean_accept = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
+        print(f"  Avg acceptance length:   {mean_accept:.2f}")
+        acceptance_lengths = list(chain.from_iterable(r[block_size].acceptance_lengths for r in responses))
+        histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
+        print(f"  Acceptance histogram:    {[f'{x * 100:.1f}%' for x in histogram]}")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -247,9 +245,13 @@ def _run_transformers(args: argparse.Namespace) -> None:
         args.model, attn_implementation=attn_impl, dtype=torch.bfloat16,
     ).to(device).eval()
 
-    draft_model = DFlashDraftModel.from_pretrained(
-        args.draft_model, attn_implementation=attn_impl, dtype=torch.bfloat16,
-    ).to(device).eval()
+    draft_model = None
+    block_size = None
+    if args.draft_model:
+        draft_model = DFlashDraftModel.from_pretrained(
+            args.draft_model, attn_implementation=attn_impl, dtype=torch.bfloat16,
+        ).to(device).eval()
+        block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
     ssd_draft = None
     if args.ssd_draft_model:
@@ -258,7 +260,6 @@ def _run_transformers(args: argparse.Namespace) -> None:
             args.ssd_draft_model, attn_implementation=attn_impl, dtype=torch.bfloat16,
         ).to(device).eval()
 
-    block_size = args.block_size if args.block_size is not None else draft_model.block_size
     num_draft_tokens = args.num_draft_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     dataset = load_and_process_dataset(args.dataset)
@@ -276,15 +277,29 @@ def _run_transformers(args: argparse.Namespace) -> None:
             input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
 
             response = {}
-            for bs in [1, block_size]:
-                response[bs] = dflash_generate(
+
+            # AR baseline (block_size=1 — draft model never called in this mode)
+            response[1] = dflash_generate(
+                draft_model,
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                stop_token_ids=[tokenizer.eos_token_id],
+                temperature=args.temperature,
+                block_size=1,
+                mask_token_id=0,
+                return_stats=True,
+            )
+
+            if draft_model is not None:
+                response[block_size] = dflash_generate(
                     draft_model,
                     target=target,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
                     stop_token_ids=[tokenizer.eos_token_id],
                     temperature=args.temperature,
-                    block_size=bs,
+                    block_size=block_size,
                     return_stats=True,
                 )
 
@@ -300,8 +315,9 @@ def _run_transformers(args: argparse.Namespace) -> None:
                     return_stats=True,
                 )
 
-            spec_response = response[block_size]
-            generated_ids = spec_response.output_ids[0, spec_response.num_input_tokens:]
+            # Use the best available response for multi-turn context
+            ctx_response = response.get(block_size) or response.get("sd") or response[1]
+            generated_ids = ctx_response.output_ids[0, ctx_response.num_input_tokens:]
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
@@ -383,9 +399,13 @@ def _run_mlx(args: argparse.Namespace) -> None:
 
     logger.info(f"Loading target: {args.model}")
     model, tokenizer = load(args.model)
-    logger.info(f"Loading draft: {args.draft_model}")
-    draft = load_draft(args.draft_model, sliding_window_size=args.draft_sliding_window_size)
-    block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
+
+    draft = None
+    block_size = None
+    if args.draft_model:
+        logger.info(f"Loading DFlash draft: {args.draft_model}")
+        draft = load_draft(args.draft_model, sliding_window_size=args.draft_sliding_window_size)
+        block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
 
     ssd_draft_model = None
     if args.ssd_draft_model:
@@ -397,7 +417,8 @@ def _run_mlx(args: argparse.Namespace) -> None:
 
     warmup_prompt = tokenizer.encode("Hi")
     list(stream_generate_baseline(model, tokenizer, warmup_prompt, 3, sampler=sampler))
-    list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
+    if draft is not None:
+        list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
     if ssd_draft_model is not None:
         list(stream_generate_baseline(model, tokenizer, warmup_prompt, 3,
                                        draft_model=ssd_draft_model, sampler=sampler))
@@ -419,7 +440,7 @@ def _run_mlx(args: argparse.Namespace) -> None:
             response[1] = _make_decode_metrics(len(tokens_bl), tps_bl, [1])
 
             if ssd_draft_model is not None:
-                tokens_sd, tps_sd, accs_sd = [], 0, []
+                tokens_sd, tps_sd = [], 0
                 for r in stream_generate_baseline(
                     model, tokenizer, prompt, args.max_new_tokens,
                     draft_model=ssd_draft_model, sampler=sampler,
@@ -429,14 +450,20 @@ def _run_mlx(args: argparse.Namespace) -> None:
                 # mlx_lm's built-in SD doesn't expose per-step acceptance counts
                 response["sd"] = _make_decode_metrics(len(tokens_sd), tps_sd, [])
 
-            tokens_df, accs, tps_df = [], [], 0
-            for r in stream_generate(model, draft, tokenizer, prompt, block_size, args.max_new_tokens, sampler=sampler):
-                tokens_df.extend(r.tokens)
-                accs.append(r.accepted)
-                tps_df = r.generation_tps
-            response[block_size] = _make_decode_metrics(len(tokens_df), tps_df, accs)
+            output_tokens = tokens_bl  # default multi-turn context from AR
+            if draft is not None:
+                tokens_df, accs, tps_df = [], [], 0
+                for r in stream_generate(model, draft, tokenizer, prompt, block_size, args.max_new_tokens, sampler=sampler):
+                    tokens_df.extend(r.tokens)
+                    accs.append(r.accepted)
+                    tps_df = r.generation_tps
+                response[block_size] = _make_decode_metrics(len(tokens_df), tps_df, accs)
+                output_tokens = tokens_df
 
-            output_text = tokenizer.decode(tokens_df)
+            if ssd_draft_model is not None:
+                output_tokens = tokens_sd  # prefer SD output for multi-turn context
+
+            output_text = tokenizer.decode(output_tokens)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
 
@@ -579,12 +606,12 @@ def main() -> None:
     )
 
     if args.backend == "transformers":
-        if args.draft_model is None:
-            parser.error("--draft-model is required for transformers backend")
+        if args.draft_model is None and args.ssd_draft_model is None:
+            parser.error("--draft-model or --ssd-draft-model is required for transformers backend")
         _run_transformers(args)
     elif args.backend == "mlx":
-        if args.draft_model is None:
-            parser.error("--draft-model is required for mlx backend")
+        if args.draft_model is None and args.ssd_draft_model is None:
+            parser.error("--draft-model or --ssd-draft-model is required for mlx backend")
         _run_mlx(args)
     else:
         _run_server(args)
