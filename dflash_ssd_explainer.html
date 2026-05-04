@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DFlash + SSD: Why They Can't Be Combined</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f1117;
+    color: #e8eaf6;
+    min-height: 100vh;
+    padding: 20px;
+  }
+
+  h1 {
+    text-align: center;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #90caf9;
+    margin-bottom: 6px;
+    letter-spacing: .5px;
+  }
+  .subtitle {
+    text-align: center;
+    font-size: .85rem;
+    color: #78909c;
+    margin-bottom: 18px;
+  }
+
+  /* ── Scene tabs ─────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 6px;
+    justify-content: center;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .tab {
+    padding: 7px 14px;
+    border: 1px solid #37474f;
+    border-radius: 20px;
+    background: #1e2530;
+    color: #90a4ae;
+    cursor: pointer;
+    font-size: .78rem;
+    transition: all .2s;
+    user-select: none;
+  }
+  .tab:hover { background: #263040; color: #cfd8dc; }
+  .tab.active {
+    background: #1565c0;
+    border-color: #42a5f5;
+    color: #e3f2fd;
+    font-weight: 600;
+  }
+
+  /* ── Main stage ─────────────────────────────── */
+  .stage {
+    max-width: 960px;
+    margin: 0 auto;
+    background: #141922;
+    border: 1px solid #263040;
+    border-radius: 12px;
+    padding: 24px;
+    min-height: 480px;
+  }
+
+  .scene-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #e8eaf6;
+    margin-bottom: 4px;
+  }
+  .scene-subtitle {
+    font-size: .82rem;
+    color: #607d8b;
+    margin-bottom: 20px;
+  }
+
+  /* ── Pipeline ───────────────────────────────── */
+  .pipeline-wrap {
+    position: relative;
+    margin-bottom: 24px;
+  }
+  .time-axis {
+    display: flex;
+    align-items: center;
+    margin-bottom: 6px;
+    padding-left: 110px;
+  }
+  .time-arrow {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(to right, #37474f, #546e7a);
+    position: relative;
+  }
+  .time-arrow::after {
+    content: 'TIME →';
+    position: absolute;
+    right: 0;
+    top: -8px;
+    font-size: .65rem;
+    color: #546e7a;
+    letter-spacing: 1px;
+  }
+
+  .lane {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+    gap: 0;
+  }
+  .lane-label {
+    width: 110px;
+    flex-shrink: 0;
+    font-size: .75rem;
+    color: #90a4ae;
+    line-height: 1.3;
+    padding-right: 10px;
+    text-align: right;
+  }
+  .lane-label strong { display: block; font-size: .8rem; color: #b0bec5; }
+
+  .lane-track {
+    flex: 1;
+    height: 52px;
+    position: relative;
+    background: #1a2030;
+    border-radius: 6px;
+    border: 1px solid #1e2a3a;
+    overflow: visible;
+  }
+
+  /* operation blocks */
+  .op {
+    position: absolute;
+    top: 4px;
+    height: 44px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    font-size: .7rem;
+    font-weight: 600;
+    color: #fff;
+    cursor: default;
+    transition: opacity .3s, transform .3s;
+    opacity: 0;
+    transform: scaleX(.3);
+    transform-origin: left center;
+    overflow: hidden;
+    white-space: nowrap;
+    border: 1px solid rgba(255,255,255,.15);
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  .op.show {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  .op .op-icon { font-size: 1.1rem; line-height: 1; }
+  .op .op-label { font-size: .62rem; margin-top: 1px; opacity: .9; }
+  .op .op-tokens {
+    font-size: .58rem;
+    background: rgba(0,0,0,.35);
+    padding: 1px 4px;
+    border-radius: 3px;
+    margin-top: 2px;
+  }
+
+  /* op colours */
+  .op-verify   { background: linear-gradient(135deg,#1565c0,#1976d2); }
+  .op-draft-lm { background: linear-gradient(135deg,#2e7d32,#43a047); }
+  .op-draft-df { background: linear-gradient(135deg,#e65100,#f57c00); }
+  .op-idle     { background: linear-gradient(135deg,#263040,#37474f); color:#546e7a; border-style:dashed; }
+  .op-blocked  { background: linear-gradient(135deg,#7f1010,#c62828); animation: pulse-red 1s ease-in-out infinite; }
+  .op-ar       { background: linear-gradient(135deg,#4a148c,#7b1fa2); }
+
+  @keyframes pulse-red {
+    0%,100% { box-shadow: 0 0 0 0 rgba(198,40,40,.4); }
+    50%     { box-shadow: 0 0 0 8px rgba(198,40,40,0); }
+  }
+
+  /* token flow arrow */
+  .token-arrow {
+    position: absolute;
+    opacity: 0;
+    transition: opacity .4s;
+    pointer-events: none;
+    font-size: .65rem;
+    color: #ffd54f;
+    text-align: center;
+    z-index: 10;
+  }
+  .token-arrow.show { opacity: 1; }
+  .token-arrow-line {
+    width: 2px;
+    background: linear-gradient(to bottom, #ffd54f, transparent);
+    margin: 0 auto;
+    border-radius: 1px;
+  }
+  .token-arrow-head { color: #ffd54f; font-size: .8rem; }
+
+  /* dependency arrows (SVG overlay) */
+  .dep-svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  /* ── Info box ───────────────────────────────── */
+  .info-box {
+    background: #1a2030;
+    border: 1px solid #263040;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 16px;
+    font-size: .82rem;
+    line-height: 1.6;
+    color: #cfd8dc;
+    min-height: 70px;
+  }
+  .info-box .highlight { color: #ffd54f; font-weight: 600; }
+  .info-box .good     { color: #81c784; font-weight: 600; }
+  .info-box .bad      { color: #ef9a9a; font-weight: 600; }
+  .info-box .blue     { color: #90caf9; font-weight: 600; }
+
+  /* ── Dependency diagram ─────────────────────── */
+  .dep-diagram {
+    margin-top: 6px;
+    overflow: hidden;
+    border-radius: 8px;
+    background: #12181f;
+    border: 1px solid #1e2a3a;
+    height: 160px;
+    position: relative;
+  }
+  .dep-diagram svg { width: 100%; height: 100%; }
+
+  /* ── Legend ─────────────────────────────────── */
+  .legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid #1e2a3a;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .72rem;
+    color: #90a4ae;
+  }
+  .legend-swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  /* ── Nav buttons ────────────────────────────── */
+  .nav {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 16px;
+    align-items: center;
+  }
+  .nav button {
+    padding: 8px 20px;
+    border-radius: 20px;
+    border: 1px solid #37474f;
+    background: #1e2530;
+    color: #90a4ae;
+    cursor: pointer;
+    font-size: .82rem;
+    transition: all .2s;
+  }
+  .nav button:hover:not(:disabled) { background: #263040; color: #cfd8dc; }
+  .nav button:disabled { opacity: .35; cursor: default; }
+  .nav .play-btn {
+    background: #1565c0;
+    border-color: #42a5f5;
+    color: #e3f2fd;
+    font-weight: 600;
+    min-width: 90px;
+  }
+  .nav .play-btn:hover { background: #1976d2; }
+  .scene-counter { font-size: .75rem; color: #546e7a; }
+
+  /* util */
+  .mt4 { margin-top: 4px; }
+  .bold { font-weight: 700; }
+</style>
+</head>
+<body>
+
+<h1>🍽️ DFlash + SSD: Why They Can't Be Combined</h1>
+<p class="subtitle">An animated kitchen analogy — click a scene or press Play</p>
+
+<div class="tabs" id="tabs"></div>
+
+<div class="stage" id="stage">
+  <!-- populated by JS -->
+</div>
+
+<div class="nav">
+  <button id="prevBtn" onclick="prevScene()">← Prev</button>
+  <button class="play-btn" id="playBtn" onclick="togglePlay()">▶ Play</button>
+  <button id="nextBtn" onclick="nextScene()">Next →</button>
+  <span class="scene-counter" id="counter"></span>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────
+// SCENE DEFINITIONS
+// ─────────────────────────────────────────────────────────────────
+
+// Each scene has:
+//  title, subtitle, info (HTML), ops[], arrows[], depSvg (HTML)
+//
+// ops: { lane, start, width, cls, icon, label, tokens, delay }
+//   lane: 0 = GPU 0, 1 = GPU 1
+//   start/width: 0..100 (% of track width)
+//   delay: ms before appearing
+//
+// arrows: { x, y1, y2, label, delay } — vertical bonus-token flows
+
+const SCENES = [
+
+  // ── SCENE 1: Autoregressive ─────────────────────────────────────
+  {
+    title: "Scene 1 — Autoregressive Generation",
+    subtitle: "🧑‍🍳 Head Chef alone. One token at a time.",
+    info: `The <span class="blue">Head Chef (target model)</span> cooks <span class="highlight">every single token alone, one by one</span>.
+           No help, no parallelism. If a response is 200 tokens, that's 200 separate cooking sessions — brutally slow.
+           Each blue block = 1 token. Notice how time stretches on forever…`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Target" },
+    ],
+    ops: [
+      { lane:0, start:0,  width:6, cls:'op-ar', icon:'🔵', label:'tok 1', delay:100 },
+      { lane:0, start:7,  width:6, cls:'op-ar', icon:'🔵', label:'tok 2', delay:300 },
+      { lane:0, start:14, width:6, cls:'op-ar', icon:'🔵', label:'tok 3', delay:500 },
+      { lane:0, start:21, width:6, cls:'op-ar', icon:'🔵', label:'tok 4', delay:700 },
+      { lane:0, start:28, width:6, cls:'op-ar', icon:'🔵', label:'tok 5', delay:900 },
+      { lane:0, start:35, width:6, cls:'op-ar', icon:'🔵', label:'tok 6', delay:1100 },
+      { lane:0, start:42, width:6, cls:'op-ar', icon:'🔵', label:'tok 7', delay:1300 },
+      { lane:0, start:49, width:6, cls:'op-ar', icon:'…',  label:'…',    delay:1500 },
+    ],
+    arrows: [],
+    depSvgFn: () => makeDepSvg([
+      { id:'tok',   x:100, y:80, label:'Past tokens', color:'#90caf9', w:100 },
+      { id:'model', x:380, y:80, label:'Head Chef',   color:'#7b1fa2', w:100 },
+      { id:'out',   x:660, y:80, label:'Next token',  color:'#7b1fa2', w:100 },
+    ],[
+      { from:'tok',   to:'model', label:'reads', color:'#90caf9' },
+      { from:'model', to:'out',   label:'generates', color:'#ce93d8' },
+    ]),
+  },
+
+  // ── SCENE 2: Standard Speculative Decoding ──────────────────────
+  {
+    title: "Scene 2 — Standard Speculative Decoding (SD)",
+    subtitle: "👨‍🍳 Prep Chef drafts, 🧑‍🍳 Head Chef verifies a batch at once.",
+    info: `A cheap <span class="blue">Prep Chef (small LM draft)</span> quickly cooks a rough 15-bite draft.
+           The <span class="blue">Head Chef verifies all 15 in one pass</span> — almost as fast as checking 1.
+           Accepted tokens are kept; the first wrong one triggers a correction.
+           <span class="good">Already ~3–5× faster than AR!</span>`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Verify" },
+      { label: "👨‍🍳 Prep Chef",  sublabel: "GPU 0 · LM Draft" },
+    ],
+    ops: [
+      // step 1
+      { lane:1, start:0,  width:14, cls:'op-draft-lm', icon:'✏️', label:'draft ×15', delay:100 },
+      { lane:0, start:15, width:20, cls:'op-verify',   icon:'✅', label:'verify',    tokens:'+12 tok', delay:600 },
+      // step 2
+      { lane:1, start:36, width:14, cls:'op-draft-lm', icon:'✏️', label:'draft ×15', delay:1200 },
+      { lane:0, start:51, width:20, cls:'op-verify',   icon:'✅', label:'verify',    tokens:'+10 tok', delay:1700 },
+      // step 3
+      { lane:1, start:72, width:14, cls:'op-draft-lm', icon:'✏️', label:'draft ×15', delay:2300 },
+      { lane:0, start:87, width:13, cls:'op-verify',   icon:'✅', label:'verify',    tokens:'+11 tok', delay:2800 },
+    ],
+    arrows: [],
+    depSvgFn: () => makeDepSvg([
+      { id:'seq',   x:60,  y:80, label:'Token sequence',  color:'#90caf9', w:120 },
+      { id:'prep',  x:300, y:80, label:'Prep Chef draft',  color:'#43a047', w:110 },
+      { id:'chef',  x:530, y:80, label:'Head Chef verify', color:'#1976d2', w:120 },
+      { id:'out',   x:770, y:80, label:'Accepted tokens',  color:'#9c27b0', w:110 },
+    ],[
+      { from:'seq',  to:'prep',  label:'reads', color:'#90caf9' },
+      { from:'prep', to:'chef',  label:'draft block', color:'#81c784' },
+      { from:'chef', to:'out',   label:'keeps matched', color:'#ce93d8' },
+    ]),
+  },
+
+  // ── SCENE 3: SSD — parallel draft on GPU 1 ──────────────────────
+  {
+    title: "Scene 3 — SSD / SAGUARO: It Works! ✅",
+    subtitle: "Prep Chef runs on GPU 1 IN PARALLEL with Head Chef's verify on GPU 0.",
+    info: `<span class="good">Key insight:</span> The Prep Chef only needs the <span class="blue">token sequence so far</span> — nothing from the current verification.
+           So while the Head Chef tastes Course 1 on GPU 0, the Prep Chef prepares Course 2 on GPU 1.
+           When verify finishes, the next draft is <span class="highlight">already waiting</span>.
+           <span class="good">T_wall ≈ T_verify only. Draft latency hidden!</span>`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Verify" },
+      { label: "👨‍🍳 Prep Chef",  sublabel: "GPU 1 · LM Draft" },
+    ],
+    ops: [
+      // warmup
+      { lane:1, start:0,  width:14, cls:'op-draft-lm', icon:'✏️', label:'draft step 1', delay:100 },
+      // step 1: verify || draft step 2
+      { lane:0, start:15, width:26, cls:'op-verify',   icon:'✅', label:'verify step 1', tokens:'+11 tok', delay:600 },
+      { lane:1, start:15, width:14, cls:'op-draft-lm', icon:'✏️', label:'draft step 2',  delay:600 },
+      // step 2: verify || draft step 3
+      { lane:0, start:42, width:26, cls:'op-verify',   icon:'✅', label:'verify step 2', tokens:'+10 tok', delay:1300 },
+      { lane:1, start:42, width:14, cls:'op-draft-lm', icon:'✏️', label:'draft step 3',  delay:1300 },
+      // step 3
+      { lane:0, start:69, width:26, cls:'op-verify',   icon:'✅', label:'verify step 3', tokens:'+12 tok', delay:2000 },
+      { lane:1, start:69, width:14, cls:'op-draft-lm', icon:'✏️', label:'draft step 4',  delay:2000 },
+    ],
+    arrows: [
+      { x:40, label:'bonus →\nnext draft', delay:900 },
+    ],
+    depSvgFn: () => makeDepSvg([
+      { id:'seq',   x:80,  y:80, label:'Token sequence', color:'#90caf9', w:120 },
+      { id:'prep',  x:320, y:80, label:'Prep Chef (LM)',  color:'#43a047', w:110 },
+      { id:'note',  x:570, y:18, label:'✅ Prep Chef\ndoes NOT need\nverify output',
+                                   color:'#2e7d32', w:140, note:true },
+    ],[
+      { from:'seq',  to:'prep', label:'all it needs!', color:'#81c784', thick:true },
+    ]),
+  },
+
+  // ── SCENE 4: How DFlash works ───────────────────────────────────
+  {
+    title: "Scene 4 — How DFlash Works 🔮",
+    subtitle: "The magical parallel baker: fills ALL slots at once.",
+    info: `DFlash draft fills a <span class="highlight">16-token block simultaneously</span> — one forward pass, not 15.
+           But it requires <span class="bad">two special inputs</span>:
+           <br><br>
+           1️⃣  <span class="bad">Bonus token</span> — the last token the Head Chef just approved → goes to Slot 0<br>
+           2️⃣  <span class="bad">Tasting notes</span> (hidden states) — the Head Chef's flavour profile from the current review<br>
+           <br>
+           Both only exist <span class="highlight">after</span> verification completes.`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Verify" },
+      { label: "🔮 DFlash Baker", sublabel: "GPU 1 · Block Draft" },
+    ],
+    ops: [
+      // step 1
+      { lane:0, start:0,  width:30, cls:'op-verify',   icon:'✅', label:'verify + hidden states', delay:100 },
+      // DFlash must wait for step 1 to finish, then fills block instantly
+      { lane:1, start:31, width:16, cls:'op-draft-df', icon:'🔮', label:'fill 15 slots at once!', delay:1200 },
+      // step 2
+      { lane:0, start:48, width:30, cls:'op-verify',   icon:'✅', label:'verify + hidden states', delay:1800 },
+      { lane:1, start:79, width:16, cls:'op-draft-df', icon:'🔮', label:'fill 15 slots at once!', delay:2800 },
+    ],
+    arrows: [
+      { x:29, label:'bonus +\nhidden states', delay:900 },
+      { x:77, label:'bonus +\nhidden states', delay:2600 },
+    ],
+    depSvgFn: () => makeDepSvg([
+      { id:'bonus', x:60,  y:55,  label:'🎁 Bonus token',   color:'#ffd54f', w:115 },
+      { id:'notes', x:60,  y:120, label:'📋 Hidden states', color:'#ff8a65', w:115 },
+      { id:'df',    x:330, y:80,  label:'🔮 DFlash Baker',  color:'#e65100', w:115 },
+      { id:'block', x:600, y:80,  label:'Full 16-tok block', color:'#9c27b0', w:115 },
+    ],[
+      { from:'bonus', to:'df',    label:'slot 0',       color:'#ffd54f' },
+      { from:'notes', to:'df',    label:'context',      color:'#ff8a65' },
+      { from:'df',    to:'block', label:'all at once!', color:'#ce93d8', thick:true },
+    ]),
+  },
+
+  // ── SCENE 5: DFlash + SSD = BROKEN ─────────────────────────────
+  {
+    title: "Scene 5 — DFlash + SSD: The Circular Trap ❌",
+    subtitle: "DFlash baker tries to run during verification… but can't start.",
+    info: `<span class="bad">The DFlash Baker is BLOCKED.</span>
+           While the Head Chef is verifying on GPU 0, DFlash wants to pre-cook on GPU 1 — but it's missing both inputs:<br><br>
+           ❌ <span class="bad">Bonus token</span> — only produced when verify <em>finishes</em><br>
+           ❌ <span class="bad">Tasting notes</span> — only produced when verify <em>finishes</em><br><br>
+           These are the <span class="highlight">outputs of the very thing we're trying to overlap</span>. Circular dependency!`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Verify" },
+      { label: "🔮 DFlash Baker", sublabel: "GPU 1 · BLOCKED" },
+    ],
+    ops: [
+      { lane:0, start:0,  width:36, cls:'op-verify',  icon:'✅', label:'verify step 1',  tokens:'+10 tok', delay:100 },
+      { lane:1, start:0,  width:36, cls:'op-blocked', icon:'🚫', label:'BLOCKED — waiting for bonus & hidden states', delay:300 },
+      // DFlash can ONLY start after verify ends
+      { lane:1, start:37, width:14, cls:'op-draft-df', icon:'🔮', label:'finally runs…', delay:1400 },
+      { lane:0, start:52, width:36, cls:'op-verify',   icon:'✅', label:'verify step 2',  tokens:'+10 tok', delay:1900 },
+      { lane:1, start:52, width:36, cls:'op-blocked',  icon:'🚫', label:'BLOCKED again', delay:2100 },
+      { lane:1, start:89, width:10, cls:'op-draft-df', icon:'🔮', label:'runs…', delay:3200 },
+    ],
+    arrows: [
+      { x:35, label:'bonus +\nnotes\n(finally!)', delay:1300 },
+    ],
+    depSvgFn: () => makeDepSvg_blocked(),
+  },
+
+  // ── SCENE 6: Side-by-side comparison ───────────────────────────
+  {
+    title: "Scene 6 — Why LM Draft Works But DFlash Doesn't",
+    subtitle: "The key difference: what each draft model actually NEEDS.",
+    info: `<span class="good">Standard LM draft</span>: only needs the <span class="blue">token sequence</span> — always available. ✅ Can start during verify.<br>
+           <span class="bad">DFlash draft</span>: needs <span class="bad">bonus token + hidden states</span> — both produced BY verify. ❌ Must wait for verify to end.<br><br>
+           <span class="highlight">DFlash is faster per draft step (1 pass vs 15)</span>, but that speed advantage can't help SSD because
+           the data dependency makes parallel execution impossible.`,
+    lanes: [
+      { label: "🧑‍🍳 Head Chef", sublabel: "GPU 0 · Verify" },
+      { label: "👨‍🍳 LM Draft",   sublabel: "GPU 1 · ✅ Free" },
+      { label: "🔮 DFlash",       sublabel: "GPU 1 · ❌ Blocked" },
+    ],
+    ops: [
+      { lane:0, start:0,  width:36, cls:'op-verify',    icon:'✅', label:'verify', delay:100 },
+      { lane:1, start:0,  width:20, cls:'op-draft-lm',  icon:'✏️', label:'LM: runs freely\n(only needs sequence)', delay:300 },
+      { lane:2, start:0,  width:36, cls:'op-blocked',   icon:'🚫', label:'DFlash: BLOCKED (needs bonus + hidden)', delay:300 },
+      { lane:1, start:37, width:36, cls:'op-verify',    icon:'✅', label:'verify', delay:1200 },
+      { lane:2, start:37, width:14, cls:'op-draft-df',  icon:'🔮', label:'DFlash: runs now', delay:1400 },
+      { lane:2, start:52, width:36, cls:'op-blocked',   icon:'🚫', label:'DFlash: BLOCKED again', delay:2000 },
+      { lane:1, start:74, width:36, cls:'op-verify',    icon:'✅', label:'verify', delay:2200 },
+      { lane:2, start:74, width:14, cls:'op-draft-df',  icon:'🔮', label:'DFlash', delay:2400 },
+    ],
+    arrows: [],
+    depSvgFn: () => makeDepSvg_compare(),
+  },
+];
+
+// ─────────────────────────────────────────────────────────────────
+// SVG HELPERS
+// ─────────────────────────────────────────────────────────────────
+
+function makeDepSvg(nodes, edges) {
+  const W = 900, H = 160;
+  let html = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+
+  // Draw edges first (behind nodes)
+  edges.forEach(e => {
+    const from = nodes.find(n => n.id === e.from);
+    const to   = nodes.find(n => n.id === e.to);
+    if (!from || !to) return;
+    const x1 = from.x + (from.w || 100);
+    const y1 = from.y;
+    const x2 = to.x;
+    const y2 = to.y;
+    const mx = (x1 + x2) / 2;
+    const sw = e.thick ? 2.5 : 1.5;
+    html += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+               stroke="${e.color}" stroke-width="${sw}" fill="none" stroke-dasharray="${e.thick?'none':'4 3'}" opacity=".85"/>`;
+    // arrowhead
+    html += `<polygon points="${x2-6},${y2-4} ${x2},${y2} ${x2-6},${y2+4}"
+               fill="${e.color}" opacity=".85"/>`;
+    // label
+    const lx = mx, ly = (y1 + y2) / 2 - 8;
+    html += `<text x="${lx}" y="${ly}" text-anchor="middle" fill="${e.color}"
+               font-size="10" font-family="monospace" opacity=".8">${e.label}</text>`;
+  });
+
+  // Draw nodes
+  nodes.forEach(n => {
+    if (n.note) {
+      html += `<rect x="${n.x}" y="${n.y-14}" width="${n.w}" height="52" rx="6"
+                 fill="#1b2e1b" stroke="${n.color}" stroke-width="1.5" opacity=".9"/>`;
+      const lines = n.label.split('\n');
+      lines.forEach((line, i) => {
+        html += `<text x="${n.x + n.w/2}" y="${n.y + 6 + i*16}" text-anchor="middle"
+                   fill="${n.color}" font-size="10" font-family="sans-serif">${line}</text>`;
+      });
+      return;
+    }
+    const w = n.w || 100, h = 36;
+    html += `<rect x="${n.x}" y="${n.y - h/2}" width="${w}" height="${h}" rx="7"
+               fill="${n.color}22" stroke="${n.color}" stroke-width="1.5"/>`;
+    html += `<text x="${n.x + w/2}" y="${n.y + 5}" text-anchor="middle"
+               fill="${n.color}" font-size="11" font-weight="600" font-family="sans-serif">${n.label}</text>`;
+  });
+
+  html += '</svg>';
+  return html;
+}
+
+function makeDepSvg_blocked() {
+  const W = 900, H = 160;
+  let html = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+
+  // Verify box
+  html += rect(60, 55, 130, 38, '#1976d2', '✅ Verify');
+
+  // Produces arrows
+  html += arrow(190, 74, 320, 44, '#ffd54f', 'produces →');
+  html += arrow(190, 74, 320, 104, '#ff8a65', 'produces →');
+
+  // Bonus + Notes boxes
+  html += rect(320, 26, 130, 36, '#ffd54f', '🎁 Bonus token');
+  html += rect(320, 86, 130, 36, '#ff8a65', '📋 Hidden states');
+
+  // NEED arrows → DFlash
+  html += arrow(450, 44, 580, 74, '#c62828', 'NEEDS', true);
+  html += arrow(450, 104, 580, 74, '#c62828', 'NEEDS', true);
+
+  // DFlash BLOCKED
+  html += rect(580, 55, 130, 38, '#c62828', '🚫 DFlash BLOCKED');
+
+  // Circular note
+  html += `<text x="450" y="145" text-anchor="middle" fill="#ef9a9a"
+             font-size="11" font-family="sans-serif" font-style="italic">
+             Circular: verify produces what DFlash needs to RUN DURING verify
+           </text>`;
+
+  html += '</svg>';
+  return html;
+
+  function rect(x, y, w, h, color, label) {
+    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6"
+              fill="${color}22" stroke="${color}" stroke-width="1.5"/>
+            <text x="${x+w/2}" y="${y+h/2+4}" text-anchor="middle"
+              fill="${color}" font-size="10" font-weight="600" font-family="sans-serif">${label}</text>`;
+  }
+  function arrow(x1, y1, x2, y2, color, label, thick) {
+    const sw = thick ? 2.5 : 1.5;
+    const mx = (x1+x2)/2;
+    return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+              stroke="${color}" stroke-width="${sw}" fill="none" stroke-dasharray="${thick?'none':'4 3'}"/>
+            <polygon points="${x2-6},${y2-4} ${x2},${y2} ${x2-6},${y2+4}" fill="${color}"/>
+            <text x="${(x1+x2)/2}" y="${(y1+y2)/2-6}" text-anchor="middle"
+              fill="${color}" font-size="10" font-family="monospace">${label}</text>`;
+  }
+}
+
+function makeDepSvg_compare() {
+  const W = 900, H = 160;
+  let html = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+
+  // LM path (top)
+  html += node(60, 40, 110, 32, '#90caf9', 'Token sequence');
+  html += edgePath(170, 56, 280, 56, '#81c784', 'only needs this ✅');
+  html += node(280, 40, 100, 32, '#43a047', 'LM Draft');
+  html += edgePath(380, 56, 480, 56, '#81c784', 'can start NOW');
+  html += node(480, 40, 120, 32, '#43a047', '✅ Runs in parallel');
+
+  // DFlash path (bottom)
+  html += node(60, 110, 110, 32, '#90caf9', 'Token sequence');
+  html += edgePath(170, 126, 220, 126, '#ef9a9a', '');
+  html += node(220, 94, 100, 32, '#ffd54f', '🎁 Bonus token');
+  html += node(220, 128, 100, 32, '#ff8a65', '📋 Hidden states');
+  // both need verify
+  html += `<text x="340" y="116" text-anchor="middle" fill="#ef9a9a" font-size="10" font-family="sans-serif">both from verify ❌</text>`;
+  html += edgePath(320, 110, 430, 126, '#c62828', '');
+  html += edgePath(320, 144, 430, 126, '#c62828', '');
+  html += node(430, 110, 120, 32, '#c62828', '🚫 DFlash BLOCKED');
+
+  // Labels
+  html += `<text x="450" y="16" text-anchor="middle" fill="#81c784" font-size="11" font-weight="600" font-family="sans-serif">LM Draft — independent ✅</text>`;
+  html += `<text x="450" y="86" text-anchor="middle" fill="#ef9a9a" font-size="11" font-weight="600" font-family="sans-serif">DFlash — dependent on verify ❌</text>`;
+  html += `<line x1="0" y1="78" x2="900" y2="78" stroke="#263040" stroke-width="1" stroke-dasharray="4 3"/>`;
+
+  html += '</svg>';
+  return html;
+
+  function node(x, y, w, h, color, label) {
+    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6"
+              fill="${color}20" stroke="${color}" stroke-width="1.5"/>
+            <text x="${x+w/2}" y="${y+h/2+4}" text-anchor="middle"
+              fill="${color}" font-size="9.5" font-weight="600" font-family="sans-serif">${label}</text>`;
+  }
+  function edgePath(x1, y1, x2, y2, color, label) {
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"
+              stroke="${color}" stroke-width="1.5" stroke-dasharray="4 3"/>
+            <polygon points="${x2-5},${y2-3} ${x2},${y2} ${x2-5},${y2+3}" fill="${color}"/>
+            <text x="${(x1+x2)/2}" y="${Math.min(y1,y2)-4}" text-anchor="middle"
+              fill="${color}" font-size="9" font-family="sans-serif">${label}</text>`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// RENDERER
+// ─────────────────────────────────────────────────────────────────
+
+let currentScene = 0;
+let playTimer = null;
+let animTimers = [];
+let isPlaying = false;
+
+function renderScene(idx) {
+  currentScene = idx;
+  const sc = SCENES[idx];
+
+  // Clear timers
+  animTimers.forEach(t => clearTimeout(t));
+  animTimers = [];
+
+  // Update tabs
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', i === idx);
+  });
+
+  // Update stage
+  const stage = document.getElementById('stage');
+
+  const numLanes = sc.lanes.length;
+
+  stage.innerHTML = `
+    <div class="scene-title">${sc.title}</div>
+    <div class="scene-subtitle">${sc.subtitle}</div>
+    <div class="info-box">${sc.info}</div>
+    <div class="pipeline-wrap" id="pipeline-wrap">
+      <div class="time-axis"><div class="time-arrow"></div></div>
+      ${sc.lanes.map((lane, li) => `
+        <div class="lane">
+          <div class="lane-label">
+            <strong>${lane.label}</strong>
+            ${lane.sublabel}
+          </div>
+          <div class="lane-track" id="track-${li}"></div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="dep-diagram" id="dep-diagram">${sc.depSvgFn()}</div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#1976d2"></div>Head Chef verify</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#43a047"></div>LM Draft (standard)</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#f57c00"></div>DFlash Draft</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#c62828"></div>BLOCKED 🚫</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#7b1fa2"></div>Autoregressive token</div>
+    </div>
+  `;
+
+  // Schedule op animations
+  sc.ops.forEach(op => {
+    const t = setTimeout(() => {
+      const track = document.getElementById(`track-${op.lane}`);
+      if (!track) return;
+      const div = document.createElement('div');
+      div.className = `op ${op.cls}`;
+      div.style.left = op.start + '%';
+      div.style.width = op.width + '%';
+      div.innerHTML = `
+        <span class="op-icon">${op.icon}</span>
+        <span class="op-label">${op.label}</span>
+        ${op.tokens ? `<span class="op-tokens">${op.tokens}</span>` : ''}
+      `;
+      track.appendChild(div);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => div.classList.add('show'));
+      });
+    }, op.delay);
+    animTimers.push(t);
+  });
+
+  // Update counter & buttons
+  document.getElementById('counter').textContent = `${idx + 1} / ${SCENES.length}`;
+  document.getElementById('prevBtn').disabled = idx === 0;
+  document.getElementById('nextBtn').disabled = idx === SCENES.length - 1;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// TABS & NAV
+// ─────────────────────────────────────────────────────────────────
+
+function buildTabs() {
+  const tabsEl = document.getElementById('tabs');
+  SCENES.forEach((sc, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'tab' + (i === 0 ? ' active' : '');
+    btn.textContent = `${i+1}. ${sc.title.replace(/Scene \d+ — /,'').split(':')[0].trim().substring(0,28)}`;
+    btn.onclick = () => { stopPlay(); renderScene(i); };
+    tabsEl.appendChild(btn);
+  });
+}
+
+function prevScene() {
+  stopPlay();
+  if (currentScene > 0) renderScene(currentScene - 1);
+}
+function nextScene() {
+  stopPlay();
+  if (currentScene < SCENES.length - 1) renderScene(currentScene + 1);
+}
+
+function togglePlay() {
+  if (isPlaying) stopPlay();
+  else startPlay();
+}
+
+function startPlay() {
+  isPlaying = true;
+  document.getElementById('playBtn').textContent = '⏸ Pause';
+  const advance = () => {
+    if (currentScene < SCENES.length - 1) {
+      renderScene(currentScene + 1);
+      // wait for animations to settle (longest delay + 1.5s)
+      const maxDelay = Math.max(...SCENES[currentScene].ops.map(o => o.delay), 0);
+      playTimer = setTimeout(advance, maxDelay + 2000);
+    } else {
+      stopPlay();
+    }
+  };
+  const maxDelay = Math.max(...SCENES[currentScene].ops.map(o => o.delay), 0);
+  playTimer = setTimeout(advance, maxDelay + 2000);
+}
+
+function stopPlay() {
+  isPlaying = false;
+  document.getElementById('playBtn').textContent = '▶ Play';
+  if (playTimer) clearTimeout(playTimer);
+  playTimer = null;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────────────────────────
+buildTabs();
+renderScene(0);
+</script>
+</body>
+</html>
