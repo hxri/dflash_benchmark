@@ -307,8 +307,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--block-size", type=int, default=16,
                    help="Number of tokens per Jacobi block (B)")
-    p.add_argument("--max-iters", type=int, default=10,
-                   help="Max Jacobi iterations per block before forcing acceptance")
+    p.add_argument("--max-iters", type=int, default=3,
+                   help="Max Jacobi iterations per block (>3 is always a net loss)")
     p.add_argument("--ngram-n", type=int, default=4,
                    help="N-gram order for the n-gram cache init strategy")
     p.add_argument("--context-match-n", type=int, default=3,

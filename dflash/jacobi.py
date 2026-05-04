@@ -81,14 +81,31 @@ class NGramCache:
         """Record that `new_tokens` followed the last n tokens of `context`."""
         if not new_tokens:
             return
-        # Store the direct continuation and one sliding-window shift to
-        # populate the table faster during generation.
-        for shift in range(min(len(new_tokens), 2)):
-            key_ctx = context[shift:] + new_tokens[:shift]
-            if len(key_ctx) < self.n:
+        full = context + new_tokens
+        # Store n-grams at every position within the accepted block so the
+        # table is populated aggressively (matching lookahead decoding).
+        for start in range(max(0, len(context) - self.n + 1),
+                           len(context) + len(new_tokens) - self.n):
+            key = tuple(full[start: start + self.n])
+            cont = full[start + self.n: start + self.n + self.block_size]
+            if not cont:
                 continue
-            key = tuple(key_ctx[-self.n:])
-            cont = new_tokens[shift: shift + self.block_size]
+            while len(cont) < self.block_size:
+                cont = cont + [cont[-1]]
+            self._table[key].appendleft(cont)
+
+    def update_trajectory(self, context: list[int], trajectory: list[int]) -> None:
+        """Harvest n-grams from a Jacobi trajectory (may contain wrong tokens).
+
+        This is the key idea from Lookahead Decoding: every intermediate
+        Jacobi prediction generates n-grams that may match later contexts,
+        even though the full block didn't converge.
+        """
+        full = context + trajectory
+        for start in range(max(0, len(context) - self.n + 1),
+                           len(full) - self.n):
+            key = tuple(full[start: start + self.n])
+            cont = full[start + self.n: start + self.n + self.block_size]
             if not cont:
                 continue
             while len(cont) < self.block_size:
@@ -276,7 +293,7 @@ def jacobi_generate(
     stop_token_ids: Optional[list[int]],
     temperature: float,
     block_size: int = 16,
-    max_iters: int = 10,
+    max_iters: int = 3,
     init_strategy: str = "best",        # "repeat" | "ngram" | "context" | "best"
     ngram_n: int = 4,
     context_match_n: int = 3,
@@ -342,6 +359,7 @@ def jacobi_generate(
             final_j = 0
             n_iters = 1
         else:
+            prev_j = -1  # track convergence progress for early exit
             for it in range(max_iters):
                 n_iters = it + 1
 
@@ -352,13 +370,9 @@ def jacobi_generate(
                 preds = _sample(out.logits, temperature)[0].tolist()  # length B
 
                 # Find j = first mismatch between block_guess and preds[:guess_len].
-                # preds[k] is the model's prediction for position cache_pos_before+k+1
-                # given the block up to position k.  If block_guess[:k] == preds[:k],
-                # then preds[k] is the exactly-correct AR token at that position.
                 j = 0
                 while j < guess_len and block_guess[j] == preds[j]:
                     j += 1
-                # preds[:j+1] are all provably correct (j matches + 1 correction).
 
                 final_j = j
                 final_preds = preds
@@ -366,15 +380,27 @@ def jacobi_generate(
                 converged = (j == guess_len)
                 last_iter = (it == max_iters - 1)
 
-                if converged or last_iter:
-                    # Commit: trim the excess KVs we don't need.
+                # Early exit: if the marginal gain (j - prev_j new tokens) is
+                # ≤ 1 and we already have enough, another iteration won't pay
+                # for itself.  The cost of one more iteration (T_B) buys at
+                # most 1 extra token, so we exit once the convergence frontier
+                # is only advancing by 1 per iteration.
+                marginal = j - prev_j if prev_j >= 0 else j + 1
+                should_exit = (it >= 1 and marginal <= 1 and j >= 1)
+
+                if converged or last_iter or should_exit:
                     trim = B - j - 1
                     if trim > 0:
                         target_cache.crop(cache_pos_before + j + 1)
                     break
                 else:
-                    # Retry: roll the cache back and try with a better guess.
+                    # Harvest n-grams from this trajectory before discarding.
+                    ngram_cache.update_trajectory(
+                        output[-ngram_n:], [last_tok] + list(preds[:guess_len])
+                    )
+                    # Roll the cache back and try with a better guess.
                     target_cache.crop(cache_pos_before)
+                    prev_j = j
                     block_guess = list(preds[:guess_len])
 
         block_t_ms = (_cuda_sync_time() - block_t0) * 1000.0
